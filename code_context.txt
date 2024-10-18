@@ -1,0 +1,972 @@
+// File: code.sh
+// File: code.sh
+#!/bin/bash
+
+# This works for any project
+# Put this in the root folder of your project
+# run the command chmod +x get_code_context.sh
+# then run ./get_code_context.sh
+
+# Use the current directory as the project directory
+project_dir=$(pwd)
+
+# Use a fixed name for the output file in the current directory
+output_file="${project_dir}/code_context.txt"
+
+# Check if the output file exists and remove it if it does
+if [ -f "$output_file" ]; then
+  rm "$output_file"
+fi
+
+# List of file types to ignore
+ignore_files=("*.ico" "*.pyc" "*." "*.png" "*.jpg" "*.jpeg" "*.out" "*.gif" "*.svg" "*.safetensors" "*.onnx" "*.pth" "*.bin" "*.h5")
+
+# List of directories to ignore
+ignore_dirs=("__pycache__" "venv" "data")
+
+# Recursive function to read files and append their content
+read_files() {
+  for entry in "$1"/*; do
+    # Skip ignored directories
+    for ignore_dir in "${ignore_dirs[@]}"; do
+      if [[ "$entry" == *"/$ignore_dir"* ]]; then
+        continue 2
+      fi
+    done
+
+    if [ -d "$entry" ]; then
+      # If entry is a directory, call this function recursively
+      read_files "$entry"
+    elif [ -f "$entry" ]; then
+      # Check if the file type should be ignored
+      should_ignore=false
+      for ignore_pattern in "${ignore_files[@]}"; do
+        if [[ "$entry" == $ignore_pattern ]]; then
+          should_ignore=true
+          break
+        fi
+      done
+
+      # If the file type should not be ignored, append its relative path and content to the output file
+      if ! $should_ignore; then
+        relative_path=${entry#"$project_dir/"}
+        echo "// File: $relative_path" >> "$output_file"
+        cat "$entry" >> "$output_file"
+        echo "" >> "$output_file"
+      fi
+    fi
+  done
+}
+
+# Call the recursive function for the project directory
+read_files "$project_dir"
+// File: main.py
+import os
+from src.document_processing.pdf_extractor import extract_text_from_pdf
+from src.document_processing.vector_store import create_or_load_vector_store
+from src.search.hybrid_search import process_questions
+
+# Set the environment variable to avoid OpenMP runtime error
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+if __name__ == "__main__":
+    pdf_path = "data/docs/ToR_70c4a009-c892-4468-bc1c-a48df7191a5c.pdf"
+    chroma_db, bm25_retriever, bm25_texts = create_or_load_vector_store(pdf_path)
+    questions = [
+        "What is the title of the document?",
+        "What is the full form of NFSA?"
+        "What details can beneficiaries check?",
+        "What is the duration of the warranty period?",
+        "How the ranking will be shown?"
+
+        "What is the minimum number of years of IT/ITeS services experience required to earn the first level of marks in the technical evaluation?",
+        "What is the validity period of e-Bids after opening?",
+        "What is the maximum number of consortium members allowed?",
+        "How much is the Earnest Money Deposit (EMD) required?",
+        "What is the amount of the Tender Fee including GST?",
+    ]
+
+    pdf_text_with_pages = extract_text_from_pdf(pdf_path)
+    responses = process_questions(
+        questions, pdf_text_with_pages, chroma_db, bm25_retriever, bm25_texts
+    )
+
+    for i, (question, response) in enumerate(zip(questions, responses), 1):
+        print(f"Question {i}: {question}")
+        print(f"Response: {response['response']}")
+        print(f"Page: {response['pages']}\n")
+
+// File: main_api.py
+import os
+import uuid
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from pydantic import BaseModel
+from typing import List
+import glob
+from sqlalchemy.orm import Session
+from src.document_processing.pdf_extractor import extract_text_from_pdf
+from src.document_processing.vector_store import create_or_load_vector_store
+from src.search.hybrid_search import process_questions
+from src.utils.file_utils import generate_file_hash
+from fastapi.middleware.cors import CORSMiddleware
+from database import get_db, QAFeedback
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Set the environment variable to avoid OpenMP runtime error
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Dictionary to store PDF information
+pdf_store = {}
+
+class Query(BaseModel):
+    query: str
+    pdf_id: str
+
+class MultipleQueries(BaseModel):
+    queries: List[str]
+    pdf_id: str
+
+class FeedbackModel(BaseModel):
+    question: str
+    answer: str
+    feedback: str
+    pdf_id: str
+
+def find_duplicate_pdf(new_file_path):
+    new_file_hash = generate_file_hash(new_file_path)
+    for pdf_id, pdf_info in pdf_store.items():
+        if generate_file_hash(pdf_info["path"]) == new_file_hash:
+            return pdf_id
+    return None
+
+def load_existing_stores():
+    vector_store_dir = "data/vector_stores"
+    pdf_dir = "data/docs"
+
+    for pdf_file in glob.glob(f"{pdf_dir}/*.pdf"):
+        file_name = os.path.basename(pdf_file)
+        pdf_id = file_name.split("_")[-1].split(".")[0]
+
+        chroma_dir = f"{vector_store_dir}/chroma_{file_name.replace('.pdf', '')}"
+
+        if os.path.exists(chroma_dir):
+            chroma_db, bm25_retriever, bm25_texts = create_or_load_vector_store(
+                pdf_file
+            )
+            pdf_store[pdf_id] = {
+                "path": pdf_file,
+                "chroma_db": chroma_db,
+                "bm25_retriever": bm25_retriever,
+                "bm25_texts": bm25_texts,
+            }
+            print(f"Loaded existing stores for PDF: {file_name}")
+
+@app.on_event("startup")
+async def startup_event():
+    load_existing_stores()
+
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    temp_file_path = f"data/docs/temp_{file.filename}"
+
+    # Save the uploaded file temporarily
+    with open(temp_file_path, "wb") as buffer:
+        buffer.write(await file.read())
+
+    # Check for duplicates
+    duplicate_id = find_duplicate_pdf(temp_file_path)
+    if duplicate_id:
+        os.remove(temp_file_path)  # Remove the temporary file
+        return {"pdf_id": duplicate_id, "message": "PDF already exists in the system"}
+
+    # If no duplicate, proceed with the upload
+    pdf_id = str(uuid.uuid4())
+    original_filename = file.filename.replace(".pdf", "")
+    safe_filename = "".join(c if c.isalnum() else "_" for c in original_filename)
+    new_filename = f"{safe_filename}_{pdf_id}.pdf"
+
+    pdf_path = f"data/docs/{new_filename}"
+    os.rename(temp_file_path, pdf_path)
+
+    chroma_db, bm25_retriever, bm25_texts = create_or_load_vector_store(pdf_path)
+
+    pdf_store[pdf_id] = {
+        "path": pdf_path,
+        "chroma_db": chroma_db,
+        "bm25_retriever": bm25_retriever,
+        "bm25_texts": bm25_texts,
+    }
+
+    return {"pdf_id": pdf_id, "message": "PDF uploaded and processed successfully"}
+
+@app.post("/query")
+async def query(query: Query, db: Session = Depends(get_db)):
+    if query.pdf_id not in pdf_store:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    pdf_info = pdf_store[query.pdf_id]
+    pdf_text_with_pages = extract_text_from_pdf(pdf_info["path"])
+
+    responses = process_questions(
+        [query.query],
+        pdf_text_with_pages,
+        pdf_info["chroma_db"],
+        pdf_info["bm25_retriever"],
+        pdf_info["bm25_texts"],
+    )
+
+    response = responses[0]
+
+    # Save question and answer to the database
+    qa_feedback = QAFeedback(
+        question=query.query,
+        answer=response["response"],
+        pdf_id=query.pdf_id
+    )
+    db.add(qa_feedback)
+    db.commit()
+
+    return response
+
+@app.post("/feedback")
+async def save_feedback(feedback: FeedbackModel, db: Session = Depends(get_db)):
+    qa_feedback = db.query(QAFeedback).filter(
+        QAFeedback.question == feedback.question,
+        QAFeedback.answer == feedback.answer,
+        QAFeedback.pdf_id == feedback.pdf_id
+    ).first()
+
+    if qa_feedback:
+        qa_feedback.feedback = feedback.feedback
+        db.commit()
+        return {"message": "Feedback saved successfully"}
+    else:
+        raise HTTPException(status_code=404, detail="Question-Answer pair not found")
+
+@app.post("/multiple_queries")
+async def multiple_queries(queries: MultipleQueries, db: Session = Depends(get_db)):
+    if queries.pdf_id not in pdf_store:
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    pdf_info = pdf_store[queries.pdf_id]
+    pdf_text_with_pages = extract_text_from_pdf(pdf_info["path"])
+
+    responses = process_questions(
+        queries.queries,
+        pdf_text_with_pages,
+        pdf_info["chroma_db"],
+        pdf_info["bm25_retriever"],
+        pdf_info["bm25_texts"],
+    )
+
+    # Save questions and answers to the database
+    for query, response in zip(queries.queries, responses):
+        qa_feedback = QAFeedback(
+            question=query,
+            answer=response["response"],
+            pdf_id=queries.pdf_id
+        )
+        db.add(qa_feedback)
+    db.commit()
+
+    return responses
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+// File: PDF Project Documentation.md
+# PDF Question Answering System - Technical Documentation
+
+## 1. System Overview
+
+The PDF Question Answering System is designed to extract text from PDF documents, create searchable vector stores, and answer questions based on the content of the PDFs. It uses a hybrid search approach combining vector search and BM25, and leverages language models for generating answers.
+
+## 2. Key Components
+
+### 2.1 PDF Processing
+- Location: `src/document_processing/pdf_extractor.py`
+- Main Function: `extract_text_from_pdf()`
+- Description: Uses PyMuPDFLoader to extract text from PDF files. The text is split into chunks with a specified size and overlap.
+
+### 2.2 Vector Store Creation
+- Location: `src/document_processing/vector_store.py`
+- Main Function: `create_or_load_vector_store()`
+- Description: Creates or loads Chroma vector stores and BM25 retrievers for PDF documents. Uses HuggingFace embeddings for vector representation.
+
+### 2.3 Embedding Model
+- Location: `src/embeddings/embedding_model.py`
+- Main Function: `get_embeddings()`
+- Description: Utilizes the "sentence-transformers/paraphrase-mpnet-base-v2" model to generate embeddings for text.
+
+### 2.4 Hybrid Search
+- Location: `src/search/hybrid_search.py`
+- Main Functions: `hybrid_search()`, `process_questions()`
+- Description: Implements a hybrid search combining vector search (Chroma) and BM25. Processes questions by retrieving relevant contexts and generating answers using a language model.
+
+### 2.5 API
+- Location: `main_api.py`
+- Description: Implements a FastAPI application providing endpoints for PDF upload and querying.
+
+## 3. Workflow
+
+1. PDF Upload:
+   - User uploads a PDF through the API.
+   - System extracts text and creates vector stores (Chroma and BM25).
+   - Stores are persisted for future use.
+
+2. Querying:
+   - User sends a query or multiple queries through the API.
+   - System performs hybrid search to retrieve relevant contexts.
+   - Retrieved contexts are combined and sent to the language model.
+   - Language model generates an answer.
+   - System determines the most relevant page for the answer.
+
+## 4. Key Algorithms and Methods
+
+### 4.1 Text Chunking
+- Splits PDF text into overlapping chunks for better context preservation.
+- Chunk size and overlap are configurable.
+
+### 4.2 Hybrid Search
+- Combines results from vector search (Chroma) and BM25.
+- Scores from both methods are normalized and combined.
+- Top K results are returned based on combined scores.
+
+### 4.3 Answer Generation
+- Uses Ollama language model to generate answers based on retrieved contexts.
+- Implements error handling for LLM calls.
+
+### 4.4 Page Determination
+- Uses Jaccard similarity to match the generated answer with the most relevant context.
+- Returns the page number of the highest similarity context.
+
+## 5. Data Structures
+
+### 5.1 PDF Store
+- In-memory dictionary storing information about uploaded PDFs.
+- Key: PDF ID (UUID)
+- Value: Dictionary containing file path, Chroma DB, BM25 retriever, and BM25 texts.
+
+### 5.2 Vector Stores
+- Chroma: Persistent vector store for efficient similarity search.
+- BM25: In-memory index for keyword-based retrieval.
+
+## 6. API Endpoints
+
+### 6.1 PDF Upload
+- Endpoint: `/upload_pdf`
+- Method: POST
+- Input: PDF file (multipart/form-data)
+- Output: PDF ID and status message
+
+### 6.2 Single Query
+- Endpoint: `/query`
+- Method: POST
+- Input: JSON with query and PDF ID
+- Output: Answer, relevant page number
+
+### 6.3 Multiple Queries
+- Endpoint: `/multiple_queries`
+- Method: POST
+- Input: JSON with list of queries and PDF ID
+- Output: List of answers with relevant page numbers
+
+## 7. Error Handling
+
+- Implements try-except blocks for major operations.
+- Returns meaningful error messages for API calls.
+- Handles LLM errors gracefully.
+
+## 8. Performance Considerations
+
+- Uses efficient vector search techniques for fast retrieval.
+- Implements persistence for vector stores to avoid recomputation.
+- Utilizes chunking to balance between context preservation and search efficiency.
+// File: PDF_Project_Documentation.docx
+PK  ™<ëX               _rels/.rels­ÒÁJ1à{Ÿb™{w¶UDd³½ˆĞ›H}€Ìî›LH¦ZßŞP
+ºPVÁ3ùçç#¤İı¾z§”«ºŠ‚aëÂ àu÷´¼‡M·h_h¯¥Dòèb®ÊNÈ
+F‘ø€˜ÍH^çš#…rÓsòZÊ1µyÓáºiî0ıì€nÒYm­‚´µ+¨vŸ‘ş×D[-'ZÆT¶“8Ê¥\§Deó\Æù”¨K3àeĞúï î{gè‘ÍÁSK.:
+Kv¤cœİ\SdYØÿòD§Ìéöš¤iâÛóÁÉ¢=ÏšE‹“ŸÙ}PKåröDè   Ğ  PK  ™<ëX               docProps/core.xml}’ßoÛ Çß÷WX¼Œİur¨´M•&­Ó¤¥ÚÔ7
+W‡Í¤‰ÿû‰½¨öv?>÷½;îæ0Õ3ø ­Y#ºªQFZ¥M¿F÷›[üU!
+£Ä`¬Ñİğ7tLZß½uà£†P%!˜tk´Ñ1B‚ÜÂ(Â*&%Ÿ¬EL®ï‰òè4u}MFˆB‰(HÄnQD'I%I·óCP’À #˜]QòàÇp± dÎÈQÇÉÁEtN.ô!èÜï÷«}[Ğ4?%¿î¾ş(«bmòSI@¼;Â¤AUI€ÛÍ™Ÿí§Ï›[Ä›š¶˜6¸i7MËè[V×yQŸ¶õÜMqkVV2¸Ä3£ H¯]Lçä=ğ¥ûãT½,:sá L¿K7á`ğ—oYBùÚƒñ.ı‹'êãÄ;r!6=bÿİº¹Âõ;Lé†¶¬¾fWÎ¶JgÏ:OŞ”¦‹›§»Çß #/ó.N²£Ã³ùêËò¿PKiÀ ì  ş  PK  ™<ëX               docProps/app.xmlQANÃ0¼óŠ(âJœ´Ijk„@œ ZnÕÖŞ4F‰mÙÚßã¶"ÊŸvfvgl/»İ}òÎ+£—i‘åi‚Z©ôn™¾7W4M| -¡7—é}zË/Ø«3]Pè“è ı2íB°7„xÑá >‹²JkÜ !B·#¦m•À#¾ÔÌò¼&¸¨%Ê+;¦gÇ›ïğ_SiÄñ~~Õlôã¬ÁÁö?'ûLš002²¬1úFÈóH€İYÛ+!~R[‡/§4²ÈæÙ"›]®•–æÇo>h½©ËdÒ²‰ïùDE‰ E•ÃuÛRI…¼ª²–@Û²*·ˆ[Z¶ŒLÃÉ«óVxQey<§†?½Â=/9lmœô¼ªgŒœKvßâ ŸÏ‹‚‘	1×*toD4™/J:m›H1ÏÁÎí<§ù1u„Œ«ã¿PK…zˆT  P  PK  ™<ëX               docProps/custom.xmlÎ±
+Â0…áİ§ÙÛT‘Ò´‹8;T÷Ş¶soÈM‹}{#‚î‡>NÓ=ıC¬Ùj¹/+) -'-oı¥8IÁÉà`„ å,»v×\#ˆÉ‹, k9§j¥ØÎà—9c.#EoRqR4ÎÂ™ìâ“:TÕQÙ…ù"|9ùñê5ıKdßïøŞo!{m£~gÛPKáÖ €—   ñ   PK  ™<ëX               word/_rels/document.xml.rels­“ÍjÃ0„ïy
+¡{%;mC)–s)…\‹½*òÚ±~Ö¥yûŠ¦µ¦w¤ù´‹Šı—éÉ'„¨4g%`•«µm}¯^ïè¾ÜoĞKLWb§}$©ÇFA;DÿÌyT™ó`ÓIã‚‘˜ÊĞr/ÕI¶À·Y¶ãaîAË+Or¨‡:§¤:{ø·k­àÅ©Á€Å<â¹‡˜eh½Ô,ùP~;~»f¼ÌBäD0JK÷kB4Îb%=L£´ñ°ê" 1=z¾Š_e	áqML½³ü”1_bØ­É †ˆÎ|¤´‘ƒ±IåÁüÑl
+~õçÊoPK´•ìü   ª  PK  ™<ëX               word/document.xmlí\msÛ6ş~¿£dÆ’,ÙÎ¹ºÚÄ·vìVNï£+`ĞŠúëo )Ùnr±Ò“EM3ëäbØg_!şğã§L±[0Vêü¨Õëì¶äB'2ŸµŞßœµ[Ì:'\éZs°­ÿñÃlhQf;†r;ĞG­Òä+RÈ¸mgRmõÄµ…Îz2‘âK+ŞaZ©sÅ Û7ut9M´É¸ÃfÚ·œÆ¹ºıİİ]Š;ä×¦²°µÛ/Í›©êºÙ×Ì:Ó&)Œ`-.D¦Â¼—yM¦·ûúâkfNŸ-My—‘Ó0¸ h¬Ùè qõ<¤×Û½Go˜òÔ¦ßFíÑeQQËÄ×H›qó±,hÅ
+ÜÑ±TÒÍ½à¦zûßÆÕı5[Ş’şôG _ÈÄà|škÃÇ
+‘„œ0!ÅÖ1j¬“9½şÏµñ/C7WÀfƒ[®Zo0{­.Ù‚ü„ƒcÀEE’û‡ßÙ€O ¸vÃe&PZiSÚõÿ"™?ªo÷úÕ7'öîwİH¦[3fşjÒ³;¾>=c¿”`	Üìeng`HÀáÜ:ÈX›İ€Hs)¸b•Ağv€h¸@)°øåU|G
+¨–çKÒ-}ñ¸EıG’'zJÒ+4È·f›$ØJÄ‰ı›Ø—7VZ–€•Óæ4ƒOÎpá˜Ã7lbtæo¯ÜİaÂ wÀ,p#R:0áP-ş¼ İş§YØïqVËÆÜ"}œß!CBç|—ø8í°sÇJ–q–ÎÇF&qÆ4'ß ºÇ2'Î«	ã8ß«ËşA˜YnŸ"!Åói‰ïX¦P–!JÙruD$°h;›´Íß ¿ıûæì9†
+¸S(×ŞJrõ¼^×>å‘‚]Hë^•J³çe.“êVÕv³;OªïzÑ@Ö7<Šï-¼y°Öˆn ÑÂ7v‹d2ŠpÓ¦SÌ?4C²KÄØY™‹(^aDcDc„‚={ŞiNÁ
+#‹ Ë{2@×óË5îBóMØgMâD*@³EÖ µ†PLæxHËü#:[éĞ@á 9‘h­ü¼Òh¦/6Ñü¬Ó>û-˜å!ùvBnâñáÁæ¢58‘÷rÍkğŞ#D¡~–…j&d½!jQñH"ËNRD(¿”Ô13àŒ¤!Äwb›NÀÿÛr:Å?ãdcHáòHÔ@D« x{ ¼Ç^Wò²K
+šš¡÷À»Ø³ÅÛ‘›Û)¸ÑB®f"õ½“
+½Ÿõ1ÿw¿—Úı‹0¹€6:ØÜRmÙ-¸áEj0chgE®MÉCû¶î	á<ùåÌ?@)¹ãíå>{ò¡¡Owš±ñ÷ 2µnHìFáSCÁhQ¤;r wØ‡(ŒêŒ·™=Ï
+Ş>ÈÃ?—~?÷yíc;U®†P_* Ì+ßK$`ÎsJŸ\ğĞ³sVZÿé^2¿=è>`/¯Ï›¡(K˜¦Züˆ²9ş¼–Ÿqëp¨Î¤d!šo¥ƒ O
+-éÊ*\,Š3½¾¢v›9^µ‰ê¸Ji¯Ãş­ÍÇ‰ÒÛQüìuü½÷;6X‡H4C›Òõ„4Œxph$ËiêcÔ¶µhL`&–ycÃ†bi¯ˆ™ÓİL)šóÚš?_'«1Y3À
+jŠ"ã‰Çİ¤t%~YZØ(¨­,j¿Cyo;Ö­–r{¥ô¶‹²æ¬TN¢=ôßH?±ªâŞS*`ï ñWÙûÃøa\ş™H–‚1>‚à(±!†iŸ t	Œ^Ü™¸N—(ÖŠñÕú÷6&Ãu
+i`¦­[lfAÌú.…ur¸×ºÚ3/ÕTéÒ,¼—àRlK«f¿Óc7ä]N¨øİ˜NÍªö6xi_È§ú},ÏÆZ>)æêo|æË€æv¥2àIë÷æA"Z°|"§¥?!±‰¸[M'ûM¬ŸœgbÑ6ZôÏ6´şWâİÙ†ÂGy^¢±v)Ë‚ô:˜{=Bí~´rªíFìçzÏHŒXJCQA} ¢¬_‡íÚ^<[ÂŞÄ2NSš¾ës¥Ïî×™îT™«’T½“æA Ø5]ª€1hQRÄš"WG>îââ’	®Ô©æ>»¦==ÁgÓtó'.7tx “Šcü8'ÅÌ¸!K«T´>wå<Œ¯£š6DKõ¦3ä	>3@2c.Kå4”niQV”oSs†ƒ;å³¡3¥ È¶$
+ñL—¯÷4CÏóv™6s–Hßâø–Jfd5eUSé˜uébñéÏ66BD:a= SÍpÔŠy´1iø½:?eãø7®J°ÓÅ6‘Yà¡uE‡¶Ğ˜¸t§:'rújçŞÉÅi‘õ•–Ö‚º»G´kM,a¥}B%ŒaôcËk² ú—4´äb›¹R’ºØÂÊÈ<O^¶0§Ÿ0´CØµ”odt'÷¢CEföºê³m X«€íEtq¡÷Ô¬ö`À>tƒ£“¼iğ†R*š‰«áM38>Ï‹Òê³ÄìYèÄpãºN´Œı7C”«ÒÕ²` à; »Ò²¬ÅØ}kPİgC¼‰ùş]3vg×¾í÷7¤ÿ¿şixõ.äà¡ËJxĞh†œC=oç^ƒ.¤á[ƒè=vYuÀ	ğflÒ2ª«ş(öğÿøº ®ªHU‡'š
+õ‹(GUäöÂıî71@_%ïøg‡½öµï·±ö½Ir=}_À™y>	(+-bû;ãÿÁ¿ºˆí†T¶êJrœª@“RÅ¾GŒNƒp”†®Ô÷x"©¼â"ïÔ¯ñâX65\ Š§æÛR8ìPáÇ—Wsì•N&•úm’ŒOÙZ”¿îpş‰t?œ¢ä¾´béémRu&”aé×xñàªÓŒßjI%2z¢I¹Úóş:)> dùñ ıê)±gUr57<#õ«D<wEk1æÊ#fnÿé‘¥xTÑëJ¥Câ3¦ÃâbÇ	çE½\9’¤Öj¥˜é™#3\~ß‹›âûƒÃıİê‚KNÏ*Q0q8p¸ë¯1rš.}œ–.>A…îúvüàt—íÊ­—µs:‹ƒqªwevXdH>!kø“A¹6ÚUrL¸²QZ¥S‰JäW(+s3Ã‰oè4QX";á}EÀµteŞ{áÙ)7ÃĞRÙßışET‘j)»ÕSgº‹ç9ÿPK>¥5(¸	  J  PK  ™<ëX               word/numbering.xmlí›İn›0Çï÷Ò.’E%Õ¤©Rw1MZ÷ „˜ÍÈ6I{»—Úcífòµ4ÓYjÎ•Áçüùò“·wO÷Vˆ‹’ÑÔô¯‡hÎæ%]¤Ş÷Çû›±×2£ó3ŠRï	ïnúîv=¡5™!®òzª“uê-¥¬&¾/ò%"™è³
+Q+'™T§|á¯ŸWœåH¥$Øƒ ñIVR¯-ÃR¯ætÒÖ¸!eÎ™`…¼É™°¢(sÔ[·Yx#ùÄòš *7Ër„3©|‹eY‰mµ•iıÁÛ<’Û,K2ş£®m¥–š•¸”Ïzñm™õ >©³[³¯tí•ëÎ)å ĞGÍu|ò° Œg3¬6Fò¦j[²™<Ëå—šôÎæju
+^a*ÕzQ;Ì¥š[e¸Iò§›ı½'»ÉY1’›ˆ>¢§]è÷Ï_»ùÏùv£¢M¯¾òfêZÚq›£–ğÔqÅDêEIĞ¤ûûÄ’ÎU°©³‰ª“eFú—¹Ïn«óv¸gTŠÆ¸ÈË2õ¾=“ÃZú‘Š£‰\…Kª–™£"«±lKëš¾öõwÛ–m›£¼$~±oïÃ¾ƒ¾‚±©q:lèÜËöBö"'öâØh¯	_l/ra/vboí5á‹íÅ.ì]ØÆ»Z‡/¶7ta/qboí5á‹í%.ìœØ-:|±½‘{cö¢ĞøhÑá‹í]ØûàÄ^b|´è°…=ÿ"şIáõÆÈx³Ì÷*Æ[Ft½„ñŸÿ”ÀÀÀÀÀÀÀoÉñ«ÃØ‘£˜b€€€€€€€ÖX0¼b,pñv° ° ° ° ° ° °À’+Æ7¯$       ¬Á`ôj0 Œ¢Í¼¨‹b?+—êò^ì“ƒ&™:tÜ‹½·…‚î;µåƒî;µE…î;µ¥†î;µˆî;µe‰î;µÅŠî;µ%Œ.:=…ª!ƒ~ËyDG-ğuæ‰,</²è¼,2ÈN¾IİËbƒlx^64È’ó²Ä —eşÁGÏÓ?PK8&6  :=  PK  ™<ëX               word/fontTable.xml½RËnÂ0¼÷+,ß‹SU¢ê©âPèlÌ†¬äGä5¤ü}MRÕæ@«*7Û3;³;ŞÙâÃqÄÀä]!&™è´ß‘Ûò}ûrÿ$Gp;0Şa!OÈr1¿›µyå]d‘Êçm!ë›\)Ö5Zà‰oĞ%¬òÁBL×°W­»&xÌIİ5Í²GeœìeÂ-2¾ªHã³×‹.^Dˆi®©a9ï»mîÀ¦¦·d‘Å[ñæ-¸ kŒgÎL!³Lª®,™Óõ5tôh(êúú~„@P<CêböÃts²¥7ƒ^ÓÿöZ&Ê°ÕàXÜó­^©ÄĞ…-6¨ê\ÁÄuB¯:ßóV£¾[&Ö8¿»CÉm$3„a(ê:‡=RÌ_ 5uYÇÛÛùÕ>öPK¡ğy8  ¼  PK  ™<ëX               word/settings.xmlµRËnÂ0¼÷+"ß!õ‰Ô¢¾¤À,ñ\Ù^ËŞ@Ó¯ïŠZµR/UoñÎìÎÎNn&¯Îf[ŒÉ/Ôi 2ôiã×…Z.f½+•%¯Á’ÇBµ˜Ôd|r³%dVÊd‚O£]¡6Ìa”ç©Ú ƒÔ§€^°š¢–g\ç;Š:Dª0%iu6¹ãÕXF¾¹l7
++ô\¨ës•ïëkh,/`U2alÁêr88ÀĞ0İ¶aƒXlq¹ üùUV¢'¦U³2Öpû@•@M4?,9SEJTs_ZrªkSagJEOÏ¾J~"¹t4Å‰Å’[‹3ò\š7œz=o™Ø™øÃ¿- 'å'IfÑœ!p%ÑÿÓôH<³&<˜)Şy-©şU,ÿ'KkwÂ{èt;úŞ²Ü7!$&…zŞüy_Z-ÊsğøPKêÉEÑ]    PK  ™<ëX               word/theme/theme1.xmlíZMoÛ6¾ïWº·şv¢n;v»µiƒÄíĞ#-ÓJ(:‰oC{0`X7ì°»í0l+Ğ»t¿¦[‡­úöR²Q¢äÔKš´‹FDòyø~¿¤â+×\†öˆ(÷ÚVåbÙBÄ³ùˆz“¶uwĞ¿Ğ²®]ıè
+¾,â«½à2n[”şåR)°a¹O<˜sáb	bR	¼,.+UËåfÉÅÔ³‡]Ò¶îŒÇÔ&h (­«!´àï1øòd ÆÂQ›‰;Ü9‰´¢ùpÅh·²x
+ŸƒYĞeíaÖ¶`ÿßi!†	m«~¬RÌQÒH€‚Ée”	º~øÑé¡„UNL†1_¥__»´‘–¦ªIS ïõzİ^%½{m,ZÉ§¨÷[•NJ‚(¦)¤[n”ëFš¬4µ|šµN§ÓX3ÑÔ24õ|šV¹Y_¯šhêšFm:ëİnÓDÓÈĞ4óiú—Öšu#M3Aã0êíæ“¨¨MšÀ˜³Å,-`i¥¢_G©‘8íâDsO.ÉD?à¢ë´İ–ÔCræ“1¶×ÅŒ=” \EpbIjÎòç”X(°õeÛúÄÇPb×¾yñÓ›ÏĞË‡Ï_>üõå£G/şR¿½Işú‡/ÿyòúûÙ÷¯½$üüùï¿}µ!“ˆWß<ıóùÓWß~ñ×‹pë“¸uI€n“}´Í]P¾hK2+B¦Ièº7	°‡¸Ö“»=Ã:DwÀ=Å¶q}ú@SjÇS™-qÓq5Ä&ç¬ÃE±n*1’¶›z“%r‰i°ñ^¡XİTõ¦>ä-Ü¤ëM•-Q…'Ä#©9¾KHş>¥š6©-xÀÇİ§¨ƒi±!t(ÍèÔGÏ
+e‡Ò,ºyu8+ÜpƒìéHWÌ
+7!LóÂu<•Ø-Ö
+»,	¹…¥S¨ÈÎLØšã	Á4!Œ£ŞˆA!ø˜i*İ„Ú¸$²6ÙÌÕ!BÒİBÈ-Ìy²Áw»vıb½¨ç$A»)mqY,×sX=ƒc±·<¢îQ"W¬PwéÄ1£š™ŠÂ\%\¯!36Æ$±jˆ™Ş¦úõÔï\hwi›d¿ƒ6òê»'X§[&{º¿-¤»Z—‹ı0šÚz[ø¼§÷´óv†zÚÒªtòLïZÑıoq·;¼î¹Ën{cÊØœ1r+Ğ` ¦õaöp4ùâ‹¨ïÀŸš6%#ÃA$¸ü”JgÇÁ>ÈT±R;LM–xù<€û³¥Oå•^½Ÿ¢`épQC¤óa¹ÉGÑºZÙ¼0Tt±oJÜ’’7W…šÚú¸Ô¨]:-5*ã1éQiQ¿½•ÑH*ÌÔ©Î|X½2­4«‘v•˜‘‘
+ÓT/Âù,Çx%Çé¡ƒGä(ëÖ¯ÔÎv&õ
+úV´•—E[Xğµ[ÑzÆ‚Î<´ß¶ÖÕ†…lì·­1ÜqàO×‡ıÕ1›xmË–"­Æ^pté¶_3'z:ĞÊ¦e¹fÏé:!­/¹'"W¥­Ë<ƒ©ªºrÉÉÚªtÒZÔZ•÷U‹èÉád<&¶4Fyb*µu4c*»|*‰ØqFûhÈ¦bƒuêQ:h ²êâA@©Ï3U/ğæ–~ïo¨sáBÌ|ÏN+¿ŞDtÙŒˆåO{Á òápÊF'e»Ú;´]Ne9·İéÛn^;ˆGj£Œ!l¸œŒTqh[\H‡C»ój÷ÜiL*‚3e ÄÔ¿¼•eÈ^ªq.ä‰ø3Û2¸ŠÉm:A‚B– dKÎíıv»VªÆEXÀæ›d*dÖÊB¾Á<C²GØ@ó¦r“…œEsÊÖ]Ÿ°©a½¶'ıÿí•°ş.O…š
+õã<×‹®R‰ƒØÚii{gş„"Õ#º­Ú((rÿõ0ïcé õç)*lF¬Œúê¼>àÛw(¾ª ¨&ZóÒÁF­¬VjoµÅûw5(ctÑÙ|K‘ˆµœûo6ÖC‘ˆµ†!Ôù}´HSc¦~^NİÄËH5ùe˜:€„dŒ§,ñs±À‡¡DO
+ü-QJ<ùh¦° êeÉ± sHcŞ6#::0$B*æ?Ê^N¶%‹³ÖVcs”1su5æ˜E—NU1sø&y	;3Èq$C!ağè,{1´ı‰ûtE-ñiùÄ|ºb“OåÁ
+>½ÿ3Ù«t<w?<ƒ’ {Äéõ_PKMÙç·  ©*  PK  ™<ëX               customXml/item1.xml­ŒË
+Â0E÷~E™½Mu!Rú  ®D„(¸MÒiH2%IÅş½Áå=çrªömMöB4¹vy:E½vcûy{„¶ÙT²ä´x…!KJYÃã\2Ô„V„œftÉä­ˆiú‘Ñ0h…'R‹EÙ¾(Lji4^ÌÓ
+¿ØRªˆ=«ÁXwëò'¿$ñWaLXóPKùÓ1›   ô   PK  ™<ëX               customXml/itemProps1.xml±nƒ0†÷<…u»c@	Ğ(‘ RÖª•º:æ KØF¶©ZU}÷štjÆ÷îûİñô¡&òÖI£ˆ·ÔÂtR¼¾´4‡S¹9vîĞqÏ7¯	g:0WÀèı|`Ì‰w[3£ËŞXÅ}íÀLßKµ‹BíYE)Kp©75	n”×º€¯¦M²<SÚ\Ò–VénOŸ¢¬¦Y›ì«ærë]õå†µÒoæ3ön%lõ.Vş·àMŞ&iËçñØ=‘=DŞÁŸ·”?PKó/’ÂÓ   P  PK  ™<ëX               customXml/_rels/item1.xml.relsÍ
+Â0„ï>EØ»MëADL{¡7‘
+^CºMƒÍÉVôí,xğ¸³3ß0‡æi'öÀ˜Œwª¢†NùŞ8-àÚÖ;hêÕá‚“¤lI£	‰åŒKF¢°ç<©­L…èògğÑJÊgÔ<Hu—ù¦,·<~3 ^0YÛˆm_ë^ÿaûa0
+^Íı¨àjNäíÍNçès#ëdÔH¡ıHU‘™Àó>¾X¿PK²b¶w®     PK  ™<ëX               [Content_Types].xml½•ËNÃ0E÷ıŠÈ[”¸eêcÁc	]‰rIkˆ²Òş=ã¤
+¨*MJ›JÍÌ½ç­LÆ³­Ì£X'´šQ2$(®S¡Vò¼xˆ¯Él:/v\„½ÊMÈÚ{sC©ãkÌ%Ú€ÂJ¦­dÿÚ5Œ¿³ĞËáğŠr­<(ûàA¦ã;ÈX‘ûè~‹+.ÊIt[õÔ„0crÁ™Ç2UzTg!w'„•¤‹÷ÉT–=n-Œ»ø™`Ôê  d˜,<?®x3p\RPó„ÇmE
+ÑœYÿÈ$6Ğ×0	Mzç)Õ|nµqx-’Ó‚Ô±A#°^@;"ZŸÔY&8 G!Q’@8èÒsÙ¼p^ËÎøÊ¦%üCÛt³µ¶ÿÇ-—èïĞNS7™ƒs¸p‚º"™P9œßåàúOQù6âU!—`QÒ‚Úº1D†Ô[æ¿xåšBÔÖÍŞ£æ/®bïÜÁã7ªßQç¥Í)dõº¾Èœ
+²	ØÚ¨\)İã×¦óVëä+CµSê‘z^(ƒ1-?÷ÓOPK—†üš    PK  ™<ëX               word/styles.xmlí}Í²ã8væ~Bq÷ÕW")Jªp¶CÉÎŠ¨*—;³Ëá¥®¤›©N]é¤ÛYUËöŞk/fabvÄlü6á­_aDŠ’H @à€È“Ñ]II8äùÃ÷÷÷¿¼l{Y›ıîİÃàwı‡Şz·Ü¯6»Oïşô1úfüĞ;»Õb»ß­ß=üº>>üıïÿÇß}ıöxúu»>öÎ¿ß¿ıúîáóéôúíããqùyı²8şnÿºŞ?{Ş^§ó?Ÿ¿î«×Ã~¹>ÏÃ¿l~ß|Ylv×a1ĞËfyØ÷Ï§ß-÷/ûççÍruşù Ÿü×Ëö:ÀËRäF^‡/o¯ßœÇ{]œ6O›íæôkr3½—å·ß}Úí‹§íùiÏ÷óğûó³®öË`ı¼xÛñ??Ò¦ÿJş/ÚïNÇŞ×oÇåfóîa¾xy:lç+Ÿ§»cşÊzq<M›Å»‡ÿşÏÿóßÿùï½ÿú·ı¯ÿõ¿ã–Çw×a>Ÿá|/›ó-½G¹|ã”¹<Û¬6Ù!³?	Ók·› Ç{ŒïıøÛùYlß=8ÎõÊüX¼¶]ì>]¯­wßüéCşIn—ÎwôîaqøæÃ4şácª¢Ç¢â^‹ÿJ¿½¾Î2};íßÿúúy½»İÇéğ¶N|MÌñHØi»8­w§G=º~ş~¿ü²^}8?x÷Ğ¸\üÓw?6ûÃÙ	Ş=L&éÅë—ÍûÍjµÃâúÅİçÍjıOç{úÓq½º_ÿÇ(q®tÄåşmwşogä'¾³=®Â_–ë×Ó9ÂÎŸî±~Œ°¿ı¶¹O~~ÌN.¼¤&ÿçUä µMÊçõ"äŞ (h¢ICTiW}O}ˆ¡ú¾ú#õ!ÆêCLä‡8í—¤ó¹Î//âş‚pî/áş‚p	î/àş‚08÷„}¹¿ ÌYú‹å"ù7ñ›¡°|Üœ¶ëâïĞ©.Mû½Ÿ‡Å§Ãâõs/	±%#|x{:Qou |«N‡ıîSQŒã ‹	_^?/›#!Zõc¬ÔûÃa³*ŠŠÎ3ìÁÚ.–ëÏûíj}è}\ÿrªúû÷½¯‹å†T8´Y¿ß|ú|ê}øœ$Í¢0_Té¼ñ¿ß	¯öE…78Í†¾¨_²ÿa½Ú¼½\UCN¾-‚˜A|JDl Ê#AÇ'ïß‡?¶1åşG ã“÷?Ÿ˜ï}õLœI!5¼Fê±;ßo÷‡ç·-+=ŒÔ#ø&‚úêA|Ÿ–$FêœKŸ½éryfn?…Ì£l)	•->³²eÁ§X¶,à\Ë¤tÿ¸şËæxÅ·•Ì{Ì`M‹j@[üãÛşD SšÅ·;­wÇu*Í…†¹ùmcà‰-xd
+Ù‚ çD¦“#[ğ,É<]²iš7Iü¥cŞ$¥è˜7I)úæMR–¾yS;Ga&+lAš’7)HSòÖÎcØ‚4$oBˆÆäMÊÒ”¼IAš’7)HSò&É­äMJÑ‘¼I)ú’7)K_ò&eiJŞ¤ MÉ›¤)y“‚4%oR¦ä­µÅ¢1y“²4%oR¦äM
+Ò”¼‰÷ŠZ’7)EGò&¥èKŞ¤,}É›”¥)y“‚4%oR¦äM
+Ò”¼IAš’7)HCò&„hLŞ¤,MÉ›¤)y“‚4%ob‰‡–äMJÑ‘¼I)ú’7)K_ò&eiJŞ¤ MÉ›¤)y“‚4%oR¦äM
+Ò¼	!“7)KSò&iJŞ¤ MÉ›Xm§%y“Rt$oRŠ¾äMÊÒ—¼IYš’7)HSò&iJŞ¤ MÉ›¤)y“‚4$oBˆÆäMÊÒ”¼IAš’7)H=7Äël·ëkyê@×ªæzXğõ½—üãúy}Xï–äJ
+h×'dK„^[<Ûï¿ô¨»]QµyÚnöÉ2›_	a£²eÉÿ0ï½_S—Û¹”_sÛ…âa“nç/~}=÷š]í“|ôİ*»‘guYÿ8¾‰^ºq)ıRr¯©Ôä¿Çs¨¥ßé÷Ÿ—şÄ}¾|+İõu³Úïw§Ã~›\·Vİ~qùêñ²¼ù|u»Ù­ÿøï[[¼öé•ËN¤ó?ÖÏûÃ:Õıâù´>Ä‹ÁÓQş¼¼»]?ŸR…¤wÑ‚nË8»]Ÿ0ÑNrùËú°+ª³¦­p‰‰zYêÇ¤g½¿íğº¸Çâ]ÿ°£ùİnıË‰vıì"_
+£æŸ‡Ë§÷¨¹~g"áÆ_Öë×3ò¯ù.Ÿ|vÒcÁ•¯¾ê³ŞššhÿvŠûû¿ls¶pØíæìŸ9‡½]!öoı¿ıõÿıí_şåoı¿L·]ü™ê¶ñe–ÛÆŸ1İö>ŞÅ—ÿI'vıa4If’Dh2}Ÿ=-™·ï—c„r÷é™pî1Å¹Ç >ê0}ÔôQGÀGó“Nn§U·tÏm½h<˜,·-:©OqRÀI]¦“ºNê¶ÁItRÂIİÏcºŸé~€ûİ‘ºŞèvÂ7—ÿmÂ7‡LßBúæ°…¾éµÔ7sşçxnt©¬àÎÑ3€GúLô!=Òo¡G[ê‘%ù±~ÿ1ıséŸ£ú§ß=ÿôúñß¢ÎZ¾{çÇMÜ@è	Â9ÇLçC:ç¸…Î9j©s*ğñ[4ÃÇû ^:azéÒK'-ôÒqK½0…B¹ğòì=‹åÙ„¯‰gÅŠx;ö/É;$Ú› Ë—{w?,8vÚÆè¶³<ibDuç5Û‘¹%úµ?_U“iÍWıÙ£ış$üì—/«>ûez»½Ò÷€Œ&UŒgH%$•GÊ½ÿsæËR" N^o•§f±ÄÛšhæËŸRÏq*zä9ziï_JıÄ­è'.Ÿ¸è'õ½¡{@²jHĞüÉwUMY¦Äšcû4|ÎÔƒÑy:!LÃi‡9•ÜØÊ½Ì˜_MãsÉ²šfè¨xÒµa§ 3]¿®êO·>¡,—tÒ¥T^Y5S‘G™Š<÷™íW¿ÆEİ'şzÒTÆdˆÊb1XW Dåú ¢àìş¤Êğì&Ú 5ˆb»”ÑÇM4 ²Á1 à´Nûa±<ì+DGò}éğÈê*I^OÎÄw'«òÜº;l.Ï{Í­éíµ¢¤³ J“ïªjóÒÊ¡MGõ–äù~ò‡^—Sç^EÎàq¯ZÁ¸cÓ~Bè]·RêÃŠî1r!ºG£KGJÂ¯è>Søè­Ş(u‘QE¹È]Ä”¥ş1®èc ÿ£·†¡ÔQ&eä(t”6,#HO*zKzYµÜtİ·XÉúYl/ûX·]×Å»} üh2%ü¬[È>Zºíº
+§ÏuØWÿ¬|–r\å4Ïé.[è™¾Sl! êBàBÈ¸ÿÉ,j6õ ¦ˆÖÊ±&ónÃwº·G`øÓıªzreôt|Yl·óÅ+E3óş°ï14s­­_¿Ÿ­»]¸[_dÃ	e…©ÎOªê£¿ÑTjÜ2ãò*º¨ÍL3e5ºÀj¤©Eq­/SµĞ7~Ó¿U!—»î–²ÒÖË®´8bİ¾ß<­‹¤åÈ‡Åî˜ÁÄ”OîØø‡ëqÖ½^¼_o®¸xzØ\ŸSç&ı›ŞH'LßvqÍ@{±Uº®š½Ñ™ıŠëz4a+¾¥dU“œ›VTKr‘§‘:ŸùÖ°e³‹‡‰›µÄË“¯|^ì>%ç¶ÇÿN³à.Fo‹mz&œºæéÁ°E]¯ó”F‰ÙëÑßñªøß^ÎAÄZ?p*El!Àòf]IßíVë_(Óg|LAÂÏmZóÛ/¿äóRzáÒ°&ş‡b¦?gÀİ*]¬MËøëCïü…^v9we yqº’~ƒ•Raf€jRÈ.QOò´x:¦ÿıŞr»¾pÎ×ı1î —†|ögx³¾Åó/œd›Üé»‡İ~·&~sˆ{QŞ~2I3Kñ'÷;h?u™^iÙ23|MĞÁÈ-hÊÆLùãşzfsÑš™ãœY\¾
+†m³ÆQ6Y3»É±‰YÕMˆ÷•Ï,×­T¬Kıæu¶º°¸ıé´¹~5å«ñãıïì]x7©è¥–º\R?LRrt·/<ÛğzÁ²…ÔtÇ¿­h.ú~~©³¢ûç–k³" zön¡S¼”šMï‡!Ó8tæ¬äêlÚõ$ò¢9y­ŸDß×G•–Y„-U‘)ï(Ó{®´TÁš*Òşú«7÷%ÖlMò{ûQm×«IqU}ZÎiÒ-“X½m·ku*'×ñŸ'}èˆ®£0«ˆôÂ¬âøMşWÜ }Y»æ.**S¬òØQJQäîí%}÷»-ôN>ûîöëëÛÊÛMP‹rË£š?İ _Çdı–?pÖÔ£_×Lı^jŞtõ¦ŸY \Ïdå2’ÃåÃú’CvWUıMÖ/#9¤ú­-9¨è×7S¿qıv³{#«‰‚oŸ6§`!Œ_şb·^M2rÁõãF³„2ë§÷Ye2ÿ¦Ì&C_B™AĞ¯ÍËÎà¢_îû…‰mÄ
+KS*éx$õ/y'tıÂğrfOé¾Üƒ¡Sñ#g\íÛ÷*şb,ğ¢2÷×V|r¯ïRŸ<ófÓ¨c“˜ÛÏ{Boô$ŞÛ¥‘)ñv¹Í¡ö·s—eîÅèÏ,~W|=q_ÆÏHÕvËÓßMèÜ<_ºL‹ÜŠ°\§ÅÒ¥L}Ó ÛAUì}$-ò.Ï¦Üm@Y†9PZ†™ÛºQ´Ln“ˆo;UXÔõÚ“{Mo…ëŒ)xdâ&É:YórûWœpü£‰37’•€¬uÑÉ‡½²ÕÑ¹Ï —ÅÅXæülGÖ­eÏV,¹±Aå¢§	3Ù5yBq¾²v	Kß\”Ì¬VJV	÷8G@öîk‰ÙH´Êƒ³ïó{.±—¹¡ìŒ?O-AŞh|¹—|EınOOÛtÕÛÓv¾ŞnX\şµ=õ5U—›^ı’•8 /ŸIåó[¢aü>Éìó7óx»I}æ5Ÿ”K†FüIrˆ.52²ªghw˜j·ÂÌx[fÖ+¬Ñ)L™9§ÏÚf¶?œ±óñn›BOóõuŞ-æô~ÎrR¿eMb¿¾Ú\êÇ›3
+_­ß«ıüg¹Ÿ?êoW $gÛ§çdS* ñ\?•—ë‹Iİá’‚aĞ~½˜[ñõx'}É~á?î¿Î»Õ‡Ío7ı¤óçõçáÙßŒ`ÎWŠ§Ì 6:şİ?n?zŞ§³ñ¨®F_,áwY°Zğ¢‹,Ó+K­Mñ»ÍV›{RúMT!W®ÿ\¸ş˜ÓÇãUKYC2Ìº] UÛgÕ$XÏ·ú lQ_ôéœê?¯—Å0— ^×gk~¾M²·Švç<o¶ÛxÏuü÷æQr1?3Æ×.mÜç›,QK&êy¿?üÖyõÈÂ±o¦i£–õ.ßbœ0o8>“8'£q„V^l’ÆhrÃ"Jkx>—õ™]V"5´,¢5«ÑZàQàHqì2^U"b£­Ë¢ 6úò,ÃÛÄs}×£g*Æ.ÊÆ[y{)iÄ&7,"¶†çuYo™×ee!bCË"b³±…Ñ’ÜgÄ, É_í*bU"b£-ş¦ 6úpÃÛÈŸ8îœ©\CÛd6›'%÷,‡Øä†EÄÖğ¼.ë2óº¬,DlhYDlv#6?ƒ!¸¹«El
+RDlb£·ò0±#o2šÒ3Õ½ôfb÷}oê”Ü³b“[Ãóº¬7ÈÌë²²±¡e±YØ‚(‡c* ñrW»ŠØ@¤ˆØ†bˆmh#bsco2£gª;`6±y³é|î—Ü³ä:6©a±5½ÚIÒ¤V;IÊBÄ†–EÄf7bsÂi”_EÎ“Fl
+RDl¾bómDl¡ëÏûŒÛ=™…Ø¢ÑÄ÷ÙÕ—GlrÃ"bkx^—õ™y]V"6´,"6«[„^PÜYœ'»ŒØ@T±1NEõÁ<Ušêf!)õ]øæ6îà5ÛÁf õB‚ñˆ’?Eõ?-–_>öoçLH¡¹t(œ˜
+†Îna¯š¢í R«ıÛSUW÷1Ìóa€¬Æ^.è^:0"Ú¬n›IÁVN“¤ı¾rs“vãXˆf78áù4¶Mé-˜:¿Å¿#ˆVÈİ«bÚ<"ÛZ{ß ›5ƒpÑv:m§‚tY}a²HW¾)é.Ÿú¾ïµ éBôv0»1Ï«±İLgnÁÔùÖAºBî^év$àéÖÚ3İ¬¤‹¶Ói;¤Ëê§“EºòÍtÚt!zb˜İP‡çÕØ¦§3H·`ê|K‰ ]!w¯Št;ğˆtkíµ„nÖÒEÛé´
+Òeõ!Ê"]ù&DíFº½DÌnDÄójloÔ¤[0u¾GG®»WEº	xDºµö¨B7ké¢ítÚNé²ú7e‘®|ó¦v#]ˆ,f7pâ®ÉÁ¶P]AºSç[˜té
+¹{åuºİxDºµööB7kh.ÚN£íT.«ïUéÊ7½j7Ò…è]cvã+Wc;­Î İ‚©ó­_:‚t…Ü½*ÒíHÀ#Ò­µ'ºY3Hm§Óv•‘î›á&É[§ÕÀ‡T³ĞtÔŸAGEğ]D¢ıîtŒ9.7›±ß=¼,ş¼?¼ŸÍò9şê'ë3Î˜7‹ì‡az-±ãñ”ùd¶YmRE*"×6Gô ™fµÔlº[T=TÊÊ(Ày]	K4Ğe%©©OÒí)È ntz+h3›U¨®Îûñß›°lÿÚìµzú£GØ@âŒõ3ı¬~Z•ãtD¿¢Şµİe:ì~&;*¯\§6.;±ƒ++:ÛÛ°zá(¼…«µ7ÂÄâ¶ÆpÈÏæ¿:]Ækİ´TSšPÎCÛAØ®B¹%pƒ(oâòmü³W›/ì¡o˜Gúö9"úœÉ>§£ÜÇjŸ-÷É·…ow¹[ÀÊÊ+÷©ËBlcåÎ6x®^î
+oáúFíİÀ±Ü‡g"`8äçó‹d.÷µnZª)M(÷¡í lW¡ôFĞû^æ¯6_îCß0ôìs å>ô9“}NG¹u6N¶Ü'6N»Ë}Ø_vT^¹Om\vâY>XŞèì)ÕË}@á-\ß¨ıH,÷‰—ûğ`¨Ö‡–ûŒÃöOK5…¡	å>´„íª”^ü0†7qù³W›/÷¡o˜Gúö9rúœÉ>§£ÜÇ: 0[î“? °İå><HvT^¹Om\vâ†XŞèìQ_ÕË}@á-\ß¨ı\8,÷‰—ûğtÌÖ‡–ûŒÃöOK5…¡	å>´„í*”^‚(‡ã›¸ü©ÖÙ«Í—ûĞ7Ì#}ûH¹}ÎdŸÓQîc’œ-÷ÉŸ’Üîrˆ(;*·wŸÒ¸%[êñTg,ot5º%z÷Á„·x³²ºÇÅr_…Ş}xDxÛÃË}Æ…aû§¥šÂĞ„rÚÂvUJ/N8òÓrÒ*÷¡o˜Gúö9˜Ş}èsûœrŸ/Pîó±ÜGµ)-;*¯Ü§6.;
+å±Ær_ËËíîêå> ğ®oè<eË}Šå>!ãT-÷uq¶37°Üg\¶Zª)M(÷¡í lW¡ô¡OFÍH3¨Ü‡¾aé3Øç@Ê}ès&ûD¹ï‡õjóöòáóbu¾CòXŞËÇ½ôs…3yİVú¼~ü·hÍü	Û—h~z– ¼¢9ŒNFwM „¬íU«edùLj‰«¢äOÑO‹å—O‡ıÛ&=€-y(·¼†ğÓm:‚K­‘^—Æ>…ãè/ØçroUAN=¥9øEq|óT^‡®ÉrMåê––B“ú ¼Šƒp@Îûñ_j@f¯ÕCkJBu<³0ıÒáİò }éÏ'×WÿÈè©n4›öçeG1‚p0)œÉ LNùü &†Ç€!7°pm¯%5Å0k–#N±ÍeÜ– d¢ª<Ù‚[0ìdûš’ag«ÉÈ#¾YŒAş ïv3†y4ší]ïm T˜ŞIZPr8GkA‰á#ƒ…Œk{-¨)îô„Y³Œ¡p^ş4Ä0!U>9ƒc0ìpÜš’aÇ³ÉÈSBYŒAş¬Ğv3†™;ŸâîÇ‚¨20)œILNù,&†Ç€!c°1pm¯%5Å0k–1ÎÒÉ¨ÔÆ d¢ªŒƒ"c0ë|½ºƒY'¼ÉÈƒÆXŒAş¸±v3†I4Î%’{gqUÆ &…w|”Îy~PbxŒH2×öZQSÜé	³fC¡şL†0!Ueè¤ÈÔƒaGôÔµ*É¬CbŒdäY%,Æ bI»Ãh<ï=áİéªò>()¼¥ªPr8kW¡Äp÷1ÀBÆ`!càÚ^K jŠ;=aÖğ>†|Gß|[ç0!UŞÇ€NŠŒA1˜Õå¿.Æ`VŸy#ÙîœÅä›·›1D“YÄHx÷ÙP•1€Iáuƒ’Ãi3%†Û8F2×öZQSÜé	³fC¡)`¾3dGƒ‰*wG'EÆ Äk\WB2«U­QŒ»ãY~£³×j‚pu1Ö‘#œ¤[şs¦SGdçö[Ğ+¹Ia.dlƒYt“œcd¾¥÷²vâÀºV˜¾UÓ“A‡ÆêŠê›ÂZg2àhmÊVT»´E±•`1OÁ8ş[’²ŸÄ 3†cpaÚıîÖ1\R=Å¢ğ¢šâ¾ŞG›ÁÚ5MEí:êv‘M"›D6i[Ê©²ĞÈ¾†©È'¡Œ|Ò:“Ç+2J-ªEN‰œ²İ 9¥yºWæ”ü“ê­˜‘S"§DNi[Ê©0[ØR9%”ñ‘SZg2ğxEN©EµÈ)‘S¶d §4O÷Êœ’Û¬ÛQoÖœ9%rJÛRN…ÉØÂ¦ËÈ)¡ŒœÒ:“Ç+rJ-ªEN‰œ²İ 9¥yºWæ”Üvîz;wä”È)‘SÚ–r*LÆ¶åFN	e|ä”Ö™<^‘SjQ-rJä”íÈ)ÍÓ½2§ä6üwÔş#§DN‰œÒ¶”Se‘}Û‘SB9¥u&Wä”ZT‹œ9e»ArJót¯Ì)¹GB8êGB §DN‰œÒ¶”S…VØ×Ú9%˜ñ‘SZg2èxEN©EµÈ)‘S¶d §4O÷Õ9å÷›#»Ùkü¡Bƒ×a=ä‘æP…Ş©Ce[xg]©~æYv©'Uç£2ƒ¶“¥¦Æ=DûİéûÕq¹Ù|Œ•òîáeñçıáıôe±ÄÏñP?YŸÁÑô¸Yd?Ók‰Ò§Ì'³Íj£ŒV5ÙW2ggÙ"o2
+h7ç€%o£¢ÆîCÊ:ª}°s×æıøopŞn[ÿ©kMÜ¨$ºàµ”¿ õ~ò7˜QVh?›Şßµÿ¬tğÊ‹ÃÈ!oáÖ€ãb§sÀ£- DaH­Tš?@oU€0ûçˆ|óa ÌX+ô*ÌÅš#ÂrÃ" ±€È[¸5 Ä¸Øé i‹À Hçuú–ÎüÕæè­ªf³Ê< ‘ïT‰ „k…ÆV¹XsåCXnX ö y·€; m±  ñÃ0Rgu×4 y«j „ÙÙ,@äÛš! aÆZ¡J.Ö<ù–ˆ= DŞÂ­ ÆÅNç H[, ÷
+&
+ÆaqÁqæÆ  ·ª@˜mpò D¾f¬¶Ìçbm(ÂrÃ" ±€È[¸5 Ä¸Øé i‹à ˆN£üŠÜ›@ oU€0{&äˆ|Ã ÌX+ì¯ÌÅš/ÂrÃ" ±€È[¸5 Ä¸Øé i‹À H„^PÜX’¹qƒ è­ÊòÅ§òkNıZñF‹e Gn“\v×¹¹ûî
+;Ùqÿ1‡»êÊI£ñøÛü˜¿¦œdºXÉñ8¦·¾QQá)€õhgXÍŒ.0zûCéñwºæ€,g«Ş³ YQíZ¦§–º»åM šŞã^±nĞ6õdz&©ph§>–İÇdb¼U’a	õpÔû å2‹rÉn.ÕŒÚsÌ3Ø‡Áê%d'$_5Æ=Ò¯fè—¬ílÕ¼N3UµÔå-§`Íwú0œ„éWÒ0)Æyá¥Şmi˜Y4L¶IBéÜfTç¨Án4vĞ0!;!«1î‘†5CÃdmg«æuÒ0˜©ª¥.o9k¾ß‘á4L¿‚†IÑ°òSzÏ)¤afÑ0ÙV1¥s›Qıgx {rÙAÃ„ì„4¬Æ¸GÖ“µ­š×IÃ`¦ª–º¼í4¬ñ®o¦Ó0í
+B&EÃÊ;ï9ê÷†™EÃdf•ÎmFuáâìLh²Ò°ãiX34LÖv¶j^'ƒ™ªZêò–Ó°æ{_NÃô+i˜+ï?ê¨÷Ef“mX¾àŞ¤^„ÜØŸÕ
+&d'¤a5Æ=Ò°fh˜¬ílÕ¼Ö½a SUK]ŞvÖx`Ói˜v!“¢aå]˜õ.ÌHÃÌ¢a²ÍSKç6£:²ò@v©¶ƒ†	Ù	iXq4¬&k;[5¯“†ÁLU-uyËiXó}Ğ§aú„4L˜†ıá°Y1;$Æ*4FÕÃºšz•ÔÿÒ9ÖõâÅƒŸe)Ş«)œ*.ŒBÒ+æg½b,esUó¨J_\aòøtyjÅCc**Á8n{É …Çë@ >aw÷ã¿‚î6jğÀ•œ÷y’/ó¿z‡ävÑlÚŸ—õ[`R8` LN9 ÃÀ‚Ø HPG@ZŸÆ–Á®ë 0  ÓÑ,
+Ä]®Ih z«jà€Ù·3äûv¶Ì£ÑlÄØ~îˆÏ
+¼^cPRx¡äpÚĞA‰á`Alp $¨#à@­{XËÀ×u €ƒ š¦¾°Ë5	@oU0»ÉåÁ|7¹vƒƒ™;Ÿ›"]ñYÀ¤pÀ˜œrp &†€±Á ®€¥6-\×Ap  æALçÂ.×$8 ½U5pÀìq”ò=Ú&Ñx:cà~O|VàµÇƒ’Âkî	%‡Ó9J bƒ AjZ¸®ƒà  Ì¢Ù€±œ‘ærM‚Ğ[UÌÎyp ßy£İà`4÷ÚCñY·æ J
+oÍ”Îš(1Ü5°‚JÖÀê
+8PÚÿÛ2pÀuk†Á0¤¿É¢¹\£k oU0÷ƒçÁü~ğvƒƒh2ë¡í‹Ï
+¼=lPRx;p¡äp¶7B‰á`Alp $¨#à@mWZËÀ×u €ƒh6ŸNé3.Íåš ·*Ê"Ê¯?×ƒ°7Œ`î)»?I¨"7$—ÈZBäÆä!•QÙğBfÔ`‰Úw<*…¸ÜŒúñ_ÁgL*O]˜÷ÄÂ HÀáNyfêpïšFl¨ŞÇz#Ğ ğMãWk® ]ˆ”üMé®RoÃöçœz‰¯™£J;†n}7ßËF’®	m.wÔ7—#3‹¿yÑx0ãmf­ÜGrP^çÉa9­n$Gåö¶Q·¤™Ô¸árlTo‚Í‘Ñ×Í!ŸC>‡|Î# Ÿ±K0‡Œµ@¦1ºæûVTâtBhB‚ÕÉ+í úµn;³ã¼Sï‚ÌÎ,f7ïû#o*·.‘”×©DrXNcÉQ¹}H”Æ-i;"5nG˜]]F`vÑ8Â@ø)‘ÙY ^‘ÙµÑÈì`ìâ³`&ÖdvÍ7ªÄì„Ğ„³“Wúk×ºíÌ®¼­“£ŞÖ	™YÌn2›Í†Œâ·62•[KHÊë$!9,§q„ä¨Ü>Jã–´…·+Ì®şQM0»á™ÛÑ+”´§DfgxEf×B# ³±K¼{? —²¨i½Af×|Ç¸JÌNMH0;¹qåéj×ºíÌ®¼'Ÿ£Ş“™YÌnÜ÷½ÌÆÍ\Şz€Uev²ƒr˜ì°åÌNvT^ÎT—3åÆí³k ¿_ÌÎ	£ˆ^¡¤=%2;À+2»6™³QHîÔ´Ş ³k¾İg%f'„&$˜Ü¸Ò¢_ë¶3»ò†ªzCUdvf1;o6Ï}zŞ8VŞg'9(oŸä°œ}v’£rW°+[²‚]jÜ®0»ú›³6³ÏÎ&ÂO‰ÌÎğŠÌ®F@fb—`†‘+Ö›Üg×x¯æjûìDĞ„Ì>;©qå÷Ùi×ºíÌ®¼¶£Ş™YÌ.M|·î»•ÛuKÊëÎ-9,§·ä¨ÜŞÛJã–´Ú–·#Ì®ÎÚM¼³#QÂ¦=%2;À+2»6™Œ]‚pĞKYÔ´Ş ³k¾Ñ~%f'„&$˜Ü¸ò¢]ë¶2»òıuòÛê&õ¹¦hQŞN©ûfÅğåÔHa`=RšC‘Fæ& Ñ±e’ôØ¡K°);|ƒAÑ‰V¸ã5á,(S&ÀtÖßÁ²mNsã=½É©¬#Î¯#ÔèéÚÈkhATGÎm¦XœW·€µ•‰Å@ÃòªŸLTTÈ¨£ZĞ³¬bŞ2/)ë‡<€.Yi:…ÆU?…Ko˜ °ôfyé­‘³^l«IØâX|cx|áP…¼ÇcùËoèêX€³¸ ßL±9–à@M‹E8[§U72ìt-ô-«X¸e8PW+Ä•æª†…8LXˆ³¼×ÈÑ\¶U'lq,Ä1W}æÎÀÉ{<â°‡®…8‹qàùÍ›c!Ô´Xˆ³ujQîdÖaˆè[V±p;
+q >®VˆãìAU?ãq˜°g{!®‰“m«NØâXˆcx|áÈ²¼Çc!qèêXˆ³¸ßL±9â@M‹…8[§åz®Yg×¢oYÅÂí(Äú¸Z!®üH^WıH^,Äa
+ÀBœå…¸F¾µ­:acˆc!áñ…&ó…8,Ä¡«c!ÎâBx~3ÅæXˆ5-âlZTİÈ°£ÆÑ·¬bávâ@}\­W~‚º«~‚:â0`!ÎöB\ç”ÛV°1Ä±ÇğøÂÀyÇBâĞÕ±gq!<¿™bs,Äšq¶N-Ê=â†Á0¤×si˜q-ô­¶â@}\­ç‹â|,Äa
+°#`!¾¡Çxs@=q–„8âXŸ?¿=ïñXˆÃBº:â,.Äç7Sl…8PÓb!ÎÖ©EÙfó)ca%óc!®…¾ÕöB¨W)Ä‹Ã—ï7ÇQ}‹?è%ŸHÜFWÑ\pKgcå™°f×ÂÂ‹àÙçR0Hu»•ò¼œgñôÙZ@SM—Æ3Ê–è={íÃçÅj-ArtUOĞ5	kP#ÍñTİY"ÙÏ£)Øşà°†,÷SvªR‚êt[•2ˆ:}¯=`#ëë;íBl„ØÎ6E » ÛñÜÈ§¿ÜG˜İÌvıa4¡o{B İ@€Ô`î@íº”Ù	°«L¸M5LÀméc†n·	nŸ`†pává¶ï8ã2 áv]ú=×w=qƒ Ü¶ŞİÛu)³pV™
+p›<P€ÛÒ‡	"ÜnÜ>§á6Âí6Âm/ô½™»KËÙ·5däOWä8„Ûm±Gwàv]ÊìÜ†U¦Ü&"à¶ô‘A·Û·…»‘#ÜF¸İF¸íFî`H#éÑr6ÂmÍFŞd47ÂmëíÑ¸]—2;·a•© ·ÉÃ¸-}0 Âí6Ámá£·n·n;ıáØ1 ávk·co27ÂmëíÑ¸]—2;·a•© ·ÉÀÜ–nÿ‹p»Mp[¸³Âm„Ûm„Û“‘7ê³ ávıp;tıyŸ^³¢á¶õöèÜ®K™€Û°Ê¬·“¨~~K>' m_?ï]¿ ‹µÍaí IY‘hBÙ‚ğ¤°ë0½¿ÌÒ}©®æeOÉí4hùT.7&X3PæØ Í@‰±	¿h%ıø/•d¯]—&Ò3é˜m¶ûvŞq/v!‹€‡G(=43>ê¡95ô›L*ëšvzA=êÕ¨@'ƒ†ÚÄI˜’r&í–l šÈ2J(›xı%ù#8éù’§”Ğ¡
+ë€ã¿‚7*Q%Ú­cÁtîjpüQPæW­2(³çc‘Z©·~D×J9V¡=cnT–%;l9Ï’™–ÉL+ˆœˆ¾ƒ¹r­–r-gîÍGô^È¶*°­‚+N	põ›—IÖ ã\³ñ|ŠÜkó¬k:šEA(|«È»`xÙü“Å»ä{€"ï‚Çn¥¼KhÔê¼KvØrŞ%;*ò.ƒyW4ƒÕ)–ÌæÈ»wµ€wFÎÜ¡¯S¡öDŞE7]A§¸6úÍ‰¼Ë$k€ñ®p8Ïè[ûhÓ_“¼+ˆ¦£)}Y4íV‘wÁğ.²,‹wÉ7ƒEŞÅœa
+½r3Œ'Í»
+[s£ºò¼KvØrŞ%;*ò.“y×ğÌ¼èU´|Û=‹y—tì"ïj)ï†£¡K?Úlyİt=Vœàšé7'ò.“¬Æ»?tg"]g›ç]ó ¦â·ZÎ»ÔùÙ&—ÅGä»å"Qã•ùˆRªÎGd‡-ç#²£"1™8aÑ«Kùe	óéØE>ÒR>âÍİ™Ïê$|D˜ôXqJ€;†F¿9‘˜d0>2ŸÏûı/Úô×$™E³A@§y´[Å÷@0¼‹ì—Ìâ]òm“‘w±ÁA¾+Zn†ñ¥yW¡µqnÔ¡<ï’–³ïIrTä]ó®0ˆüˆ>ñäTZÌ»¤cyWKy—3ò§#zM•Ú–yİt=VœàvÚè7'ò.“¬·ïÉ‚¾í—6ı5ºïiC:¥İ*ò.ŞE6Îfñ.ùşÙÈ»ÔHGeŞ%„«ó.Ùa9-z%GEŞe0ïŠÂÈé“dş-˜Å¼K:v‘wµ”wÍü¡ß§Ã-j^ä]tÓôXqJ •Ì‰¼Ë$k€ñ®hx3z¿	Úô×$ïŠfó)ã´oÚ­"ï’å]ñYDl²•|*K°œ¬‚æÚÛaklÀ.rÀğÙ$t§.}
+¡n].5£áÂå€ÎıŠw£Ú'ªœrĞ@p9”Äbêƒvç¤—y?ş+˜½\øc^ª,F:ÿ½Q·ìFeq ¿ÙoöäBùN¿ÚêïŞŠĞ ¡B„ Ğ pƒˆ±ß4pÌÂa4¿Uğ ¤'eÈ7¤DxĞ
+xĞ@“A„ < atôW´üÕ$<ˆœ`ÌÄoU'<(i–…ò}Ó´Ôß«kğàá¸Â^Líğ pC9xp¿#„,€~CáüÕ$<§Ñ  31ê­ê„%Œ²ğ@¾ÂƒvÀƒú[ÓtŒÂÉÜ«Ğ:N;<(ÜPÜïáÂóáAcÆ7Zşjƒˆ±+‚z«:áAIÃ,<ï¶ğ ğ 
+]ƒ‘3rûô=¨+ÛµÃƒÂ‘û/ <°81)Î_®=˜†aäŠßªNxP²/<ä7…#<h<h`£o×àëƒ)½şIm8¢n(î— <0DAè1Ú}ÒòW£k‚pÂh¢J½Upxğ‡ÃfÅ†É§²hÀí È¸«¾^&EQí„!*{z¤@HÙ„&¾ª0ù#x×›Ä«Më•7EøÄúÛc?jA¬GMaÒSõ‰E{ïs¬1Ã¸ÿô?‰^`“=àÊNõüMŠñ·Ô7)âÜs¿ÊÜ¯¶e§¹Ù6ÏCz“˜ÖÎÿúŸÙ àúÃh"â˜mÀ 5<,
+˜fg2-ì…Mâ Ğ[UD%û³H@~?""D*H@mwNsH ÎÆ³‘ğ}·	èfƒÀÄs}—{¨ÛG­F5<,ÜAÉÑt4¥/~¦ya“H ôV‘@ÉÖÃ,ßzˆH ‘€
+PÛˆÓĞp»yH@ÿ3„FşÄqE¶H †‡…;¢4‚©¸6‰@oU	”ì2Ì"ù]†ˆ	(!¥=7Í!ıG&›‡ô?³AH`y“}×µg„ÕH †‡…;4Oû	àfV®ˆJ6f‘€ü†BDˆT€Úöšæ€şC<ÍCúŸÙ $àÆŞ„şÚŠºÁÃj$PÃÃÂ­Ğ~&­™Çç*"’½ƒY$ ¿w‘ "$ ¶“¦9$ ÿX9ó€şg6	„®?¯Ò	Âj$PÃÃè¨û”D3t¼#ëÿÿPKéÅp1  Ú\ PK   ™<ëXåröDè   Ğ                   _rels/.relsPK   ™<ëXiÀ ì  ş               !  docProps/core.xmlPK   ™<ëX…zˆT  P               á  docProps/app.xmlPK   ™<ëXáÖ €—   ñ                s  docProps/custom.xmlPK   ™<ëX´•ìü   ª               K  word/_rels/document.xml.relsPK   ™<ëX>¥5(¸	  J               ‘  word/document.xmlPK   ™<ëX8&6  :=               ˆ  word/numbering.xmlPK   ™<ëX¡ğy8  ¼               ş  word/fontTable.xmlPK   ™<ëXêÉEÑ]                 v  word/settings.xmlPK   ™<ëXMÙç·  ©*                 word/theme/theme1.xmlPK   ™<ëXùÓ1›   ô                  customXml/item1.xmlPK   ™<ëXó/’ÂÓ   P               è  customXml/itemProps1.xmlPK   ™<ëX²b¶w®                     customXml/_rels/item1.xml.relsPK   ™<ëX—†üš                 û   [Content_Types].xmlPK   ™<ëXéÅp1  Ú\              Ö"  word/styles.xmlPK      Ó  !T    
+// File: PDF_Project_setup.docx
+PK  !LëX               _rels/.rels­ÒÁJ1à{Ÿb™{w¶UDd³½ˆĞ›H}€Ìî›LH¦ZßŞP
+ºPVÁ3ùçç#¤İı¾z§”«ºŠ‚aëÂ àu÷´¼‡M·h_h¯¥Dòèb®ÊNÈ
+F‘ø€˜ÍH^çš#…rÓsòZÊ1µyÓáºiî0ıì€nÒYm­‚´µ+¨vŸ‘ş×D[-'ZÆT¶“8Ê¥\§Deó\Æù”¨K3àeĞúï î{gè‘ÍÁSK.:
+Kv¤cœİ\SdYØÿòD§Ìéöš¤iâÛóÁÉ¢=ÏšE‹“ŸÙ}PKåröDè   Ğ  PK  !LëX               docProps/core.xml}’mkÛ0Çß÷S½WdÙëÆQa…B;MiÙ;Uº:ÚlIHJûJJì…,üâ~÷¿;ëÚÛİĞà¼2z‰è¢Dha¤Òİ=¯îğ*|àZòŞhX¢<ºe­°0~:cÁ¾ˆBÚ7Â.Ñ:ÛâÅî‘Ğ1ùnÜÀCt]G,x¤*Ë+2@à’N’ ¶³":HJ1KÚë³€z@Oè‚’¿l 7ø³9sD*ŒÎ¢Sr¦w^Íàv»]lëŒÆù)y}|xÊ«b¥Ó¯€X{¤x YDfßnÊ¼Ôß¾¯î«JZcZáª^UuC/›²üÕ’“ú$¸·cvk£±4b—À9	^8eC|NÖ—»¿ÅiÑ1˜
+{®»M|ßÿÈÈJ¯İsã]¼+_GÖ’3±ièáûïÖÕ\^cJWiå:~G[O¹³ƒ•Î“]ç¦³›¦ö›·ß ËóÎN´ƒ
+=ìÃ“ùÏÉ²OPKX{dä€  ş  PK  !LëX               docProps/app.xmlQAnÂ0¼÷QÔ+q€$dŒªV=Um¥¦ĞZìq•Ø–íRø}P#=Õ§™İÛKWÇ®hÔj“4Pq-¤Ú/ã÷êqTÆ‘ó ´Zá2>¡‹Wì†¾ZmĞz‰.
+Ê-ãÆ{³ Äñ;pIUPjm;ğÚ=Ñu-9>hşÕ¡òd’¦Á£G%PŒÌ`_ÿ_S¡y?·®N&ø1ZagZğÈûÉ6Úw”,­´‡¶’²IøÑ;cZÉÁ‡ßaOrgñåGfÉ4™%“ÛTB»íGYl‹,ºjÙ†}"÷ÇãAğ<…y]—¢ä%¤y1…€²Îòl‡¸+³š’ë°>y}YçIÎ¹á—£¯°GÇ2J.İh+Îg”\Jzß€îÃ ›äóœ’+âJÜHß¼àÁdšöãJ!ÏÂŞ‚i+ç}ê vÇ~ PKºîKÖV  Q  PK  !LëX               docProps/custom.xmlÎ±
+Â0…áİ§ÙÛT‘Ò´‹8;T÷Ş¶soÈM‹}{#‚î‡>NÓ=ıC¬Ùj¹/+) -'-oı¥8IÁÉà`„ å,»v×\#ˆÉ‹, k9§j¥ØÎà—9c.#EoRqR4ÎÂ™ìâ“:TÕQÙ…ù"|9ùñê5ıKdßïøŞo!{m£~gÛPKáÖ €—   ñ   PK  !LëX               word/_rels/document.xml.rels­“ÍjÃ0„ïy
+¡{%;mC)–s)…\‹½*òÚ±~Ö¥yûŠ¦µ¦w¤ù´‹Šı—éÉ'„¨4g%`•«µm}¯^ïè¾ÜoĞKLWb§}$©ÇFA;DÿÌyT™ó`ÓIã‚‘˜ÊĞr/ÕI¶À·Y¶ãaîAË+Or¨‡:§¤:{ø·k­àÅ©Á€Å<â¹‡˜eh½Ô,ùP~;~»f¼ÌBäD0JK÷kB4Îb%=L£´ñ°ê" 1=z¾Š_e	áqML½³ü”1_bØ­É †ˆÎ|¤´‘ƒ±IåÁüÑl
+~õçÊoPK´•ìü   ª  PK  !LëX               word/numbering.xmlí›İn›0Çï÷Ò.>BH•T“¦JİÅ4iİb4 Û$íí^jµW˜qHR–ÆeÅš‚z®>çÌÿ˜ÀOŠ¸¾y x°A\äŒÆ?ôœ¢)[æt;ßïo¯¦Î@È„.Ì(ŠG$œ›ù»ëíŒ–d¸Ê¨TÌ¶±³–²˜¹®H×ˆ$bÈ
+DU,cœ$Rò•»e|Yp–"!”’`7ğ¼È%INº‹’ÓY]ãŠä)g‚eò*edÆ²,OQ=ì¼ÍÂ;É'––Q¹[–#œHå[¬óBì«mLëoŞç‘´Í²$á?Ê¢Òj©Esù¨ß—ÙúáIÃšC¥«¯\wN)}OU×AÒÙİŠ2,°ÚUÈ™«mIBò$•_J2hœİ-Õşê¼Á*”«!v<=£v˜K5·Ip•äÎwû{K“‹c$w%¼G‡ĞïŸ¿óŸÓı,FY^|åÕ ÕµÔã>G-á¨ã‚‰ØE^•îsºTÁªÎ.ªNÖ	]é;ó˜]WçõpË¨•q‘æyì|{$†µô#‰T4Â9UË,Q–”XÖ¥uMWûú»m~Ë¶-Qš“?Û·÷ÁĞBß|ojjœ¿Ü9³ÛÀ†Û‘·aht[…»ºÙpZq;õŒn«pW·¡·cnßøĞá®nÇ6ÜFVÜ£Û*ÜÕmdÃíÄŠÛ©ñ)¥Ã]İNl¸Úp;
+ŒO)îêvjÃí+n#ãSJ‡ÿİ­Û€—É&¸\²™è“V¿s       ›7E6£Ë%;oh```````›7Å6á«ÙÆØ ßRƒÌıé|3       \ Œ/Glü‹8888888rñ8]0üW4 	 	 	 	 	 	 É ÉäÕ@BE»yQfÙqV®ÕÕ>Û6=35¬Ù­F¯ºÁHÿ¶‘ş;m!ıwÚ@úï´-|ôßi[ğè¿Ó¶ĞÑ§m£NOaƒjÈ O¿MnG£®Î<‘çeA6:/d'ßXe¡A6>/dÑyYdMÎË&Oeî“øç PKnH·Ø:  
+@  PK  !LëX               word/fontTable.xml½SËNÃ0¼ó–ïÔ¡„¢¦*â„z å6î¦±äG´ë&ôïqÓTBB›íÏìÎÚ‹Õ»³¢Eb|!ïf™èuØ(äÛîùöA
+à÷`ƒÇBåjy³èò*øÈ"]÷œw…¬clr¥X×è€g¡AŸ°*ƒ˜¶tP] }CA#sRwVÍ³ì^90^2ô™PUFãSĞG‡>^D-ÄÔ×¦a¹ª]îÁ¥¢wÆ!‹vâ58ğ=A×@ŒgN¶Y&Uœ±§ë)õôhLÔõõ¼2PZ<CêböÍt{re°£^ó¿özL”q«Ñ¶¸3Ì¿´z1%R¶Ø"™ªw7	½ê|Í[Mø\™XÓLwÖ$·‰ÌÂ‘ÒXÔt{¢˜?? ğ<VÔå9N4õôëƒş§I^~ PKÏz#^=  *  PK  !LëX               word/settings.xmlµSËNÃ0¼ó‘ïmÒ‚ U¤ ^RŠ8oã5Ø^ËŞPÂ×³M©¨@â‚¸ÙÙ¯}rúælöŠ1ò¥•¡¯IÿTª‡ùlp¬²Äà5XòXª“:î¬&	™…•2éàÓdUª%s˜äyª—è ) ¬¡è€eŸòE"Õ˜’”:›‹â0w`¼šJËw"—­&cÅNQ¨|hl µ<‡EÅ„ò
+¶TGãOZ¦‹.,ÑK-Î±Å¡&€¿VÕÆ»=8Iµ95cw7¤Q	ÔFó#“3u¤D¥$§¦15ö©ÔVtt°+ù]ˆäª£Ñ(I,VÜYœ‘çÊ¼ã™×Wmb#ûpğ›¹"Q¾“ÑÌ»€3n£ŒôÄ4İÏ¬	7&FŠ—^ËXÿK¬Mø(äq1ÚŸG¨_Î‰™ÜÎ³ø£n¾ûŒXJûÑ]Co¡§¡<Të"„ÄgÉ@©apu¿>Z-ÊŸ}¶_gúPKöÀr    PK  !LëX               word/theme/theme1.xmlíYKoÛ6¿ïSº·²l+u‚:EìØíÖ¦·C´DKl(Q é$¾íqÀ€aİ°Ã
+ì¶Ã°­@ìÒ}šl¶èWØ_Ë”MçÕlëĞú`“Ôïÿ~”¯^;ŒÚ'BR·-çrÍB$ö¸Oã mİô/µ¬kë\Åk*$A€ån[¡RÉšmK–±¼ÌÃ³V0í| \"f×kµ;Â4¶PŒ#Ò¶îŒFÔ#h²´Ö§Ì{¾b%Ó‰]/“¨SdXÏIäDv™@û˜µ-ãóƒ9TbX*xĞ¶jÙÇ²×¯Ú%SKh5º~ö)è
+¯Ñ‰`X:ıæê•Í’=ç¿ˆëõzİSòË ØóÀRgÛì·œÎ”§Ê‡‹¼»5·Ö¬â5şüj§ÓqW+øÆß\À·j+ÍzßœáİEı;İîJïÎğ+øş•Õ•fŸBFã½tÏ22%dÄÙ#¼ğÖ4f([Ë®œ>VËr-Â¸è .V4Fj’ö ×ÅŒMà5‚µ'ù’'–RYHz‚&ªm}”`¨ˆäõ‹^¿x†>?zøóÑ£GG2PİÀq S½úîó¿|‚ş|öí«Ç_šñRÇÿöã§¿şò…¨tàË¯şşüéË¯?ûãûÇø†ÀC> ‘è69@;<ÃÈPœbbªSlÄÄ1Niè
++èÛÌ°×!UŞĞLÀëã…wC1VÔ ¼Fàç¬Ã…Ñ¦›©,İã80c·ƒñ¾Ivw.¾½q¹LM,»!©¨¹Í ä8 1Q(}Æ÷1İ§´â×-ê	.ùH¡ûu05ºd@‡ÊLtƒF—‰IAˆwÅ7[÷P‡3ûM²_EBU`fbIXÅ×ñXáÈ¨1˜¼…UhRrw"¼ŠÃ¥‚H„qÔó‰”&š;bRQ÷&´sØ·Ø$ª"…¢{&ä-Ì¹Üä{İG‰Qg‡:öC¹)ŠÑ6WF%xµBÒ9ÄÇKÃ}u¶Ú¾KƒĞœ é“±0•áÕzœ°&qÑá+½:¢ñq;‚¾/ºqC«|ùÍ“ÿQËŞ '˜jf¾Q/ÃÍ·ç.>}û»ó&ÇÛ
+â}s~ßœßÅæ¼¬/¾%Ïº°­´36ÑÒS÷ˆ2¶«&ŒÜ’Yÿ–`ß‡Ål’•‡ü$„a!®‚ÎÆHpõ1UánˆãdY°$J¸„«…µ”wv?¥`s¶æN/•€Æj‹ûùrC¿l–l²Y uA”Ái…5®¼™0'Ršãš¥¹ÇJ³5oBİ œ¾8pVê¹hHÌˆŸú=g0Ë?"§¦Å(Ä>1,kö9Ä›î™”¸'×œl/V‹«3tĞ¶Vİºk!'mk§%F	ğ“i§Á,ˆÛ–§rO®Å9‹WÍYåÔÜeWD$BªM,Ãœ*{4}•Ïô¯»ÍÔc€¡™œN‹FËùµ°çCKF#â©%+³iñŒ»¡€†l,v0èİÌ³Ë§:}}:ÛÍ"ñª…[ÔÆü+›¢f0KB\d{K‹}ÏÆ¥ÙLSÏ^¢û9Mi\ )î»kJš¹p>møÙ¥	vqQš£m‹rèBIH½¾€}?“z!(‹T%ÄÒ×Í©®dÖ·ry“BµC$(t:
+B¶Uaç	Ìœº¾=N}¦TW&ùïì6H«w%µßBá´›ÈpóA³MÕ5úoñÁ¥y®g&¨y–Í¯©5}m+X}3N³kâêf‹ëîÒg~«Mà–Ò/hÜTxlv<ğˆ>*÷y‰x©U”_¹8[šq)«ëÔZï‹<;jÎn,qöñâÎïl×àk÷xWÛ‹%jk÷l¶ğG> Ù›p½³|E&0ËÛ"3xÈıI1d2o	¹#¦-Å;d„¨8ëœG‹zÊÍ|'Ú^6N&,ğ³M¤$®ŸL\RLïx%qv‹31`3É9>rÙ"KO±øM\v
+åÍ.3fïi]vŠ@Ãeêğx—²M‰G•Àİé_W¿ö,e×ÿPKO¸X  É  PK  !LëX               customXml/item1.xml­ŒË
+Â0E÷~E™½Mu!Rú  ®D„(¸MÒiH2%IÅş½Áå=çrªömMöB4¹vy:E½vcûy{„¶ÙT²ä´x…!KJYÃã\2Ô„V„œftÉä­ˆiú‘Ñ0h…'R‹EÙ¾(Lji4^ÌÓ
+¿ØRªˆ=«ÁXwëò'¿$ñWaLXóPKùÓ1›   ô   PK  !LëX               customXml/itemProps1.xmlA‹ƒ0„ïû+äİÓ¨´êµ¸U¡×Ò…½¦ñ©“H—]Jÿ{Szj=ÎŞ7Ãä»?9¿h¬Ğª€hB€ŠëN¨¡€ïSK2Ø•yg·sÌ:mğàPşMù›-`tnŞRjùˆ’Ù•Qy³×F2ç¥¨î{Á±Ö|‘¨Ã0¡|ñ,ù#'<[xä¡.àÒ´qšeQBš}Ò’*YoÈg˜Ö$mãMÕì¿¢z]]¡¼÷y±·ÏòÎ[Œx·ØYœ'¡Ãæñh™Ó—(ú:EyPK“Ÿ•µÎ   D  PK  !LëX               customXml/_rels/item1.xml.relsÍ
+Â0„ï>EØ»MëADL{¡7‘
+^CºMƒÍÉVôí,xğ¸³3ß0‡æi'öÀ˜Œwª¢†NùŞ8-àÚÖ;hêÕá‚“¤lI£	‰åŒKF¢°ç<©­L…èògğÑJÊgÔ<Hu—ù¦,·<~3 ^0YÛˆm_ë^ÿaûa0
+^Íı¨àjNäíÍNçès#ëdÔH¡ıHU‘™Àó>¾X¿PK²b¶w®     PK  !LëX               [Content_Types].xml½•ËNÃ0E÷ıŠÈ[”¸eêcÁc	]‰rIkˆ²Òş=ã¤
+¨*MJ›JÍÌ½ç­LÆ³­Ì£X'´šQ2$(®S¡Vò¼xˆ¯Él:/v\„½ÊMÈÚ{sC©ãkÌ%Ú€ÂJ¦­dÿÚ5Œ¿³ĞËáğŠr­<(ûàA¦ã;ÈX‘ûè~‹+.ÊIt[õÔ„0crÁ™Ç2UzTg!w'„•¤‹÷ÉT–=n-Œ»ø™`Ôê  d˜,<?®x3p\RPó„ÇmE
+ÑœYÿÈ$6Ğ×0	Mzç)Õ|nµqx-’Ó‚Ô±A#°^@;"ZŸÔY&8 G!Q’@8èÒsÙ¼p^ËÎøÊ¦%üCÛt³µ¶ÿÇ-—èïĞNS7™ƒs¸p‚º"™P9œßåàúOQù6âU!—`QÒ‚Úº1D†Ô[æ¿xåšBÔÖÍŞ£æ/®bïÜÁã7ªßQç¥Í)dõº¾Èœ
+²	ØÚ¨\)İã×¦óVëä+CµSê‘z^(ƒ1-?÷ÓOPK—†üš    PK  !LëX               word/styles.xmlí}Í’ãF’æ}Ÿ‚–§™ƒ:“ eS=Æ?tÉVRkT%µíI"+ÑÅ$sI¦JÒ±ç¾ç=ì>ÂÚvÍö2oÓfsWX I Dx8€ àUfİ*€ğøO¸púç__¶½_¼ÃÑßïŞİõÿğp×óvëıÆß}zw÷ÓGç«É]ïxrww»ßyïî~ówÿüÇÿôO_¾>~ÛzÇ^ğüîøõ—wwÏ§Óë×÷÷Çõ³÷âÿ°õvÁ½§ıáÅ=ÿ<|ºÿ²?l^ûµw<ä_¶÷ÖÃÃèşÅõww2ıCèÅ_öÇıÓéëıËışéÉ_{©àñşCô_/Û—µÌD^ÜÃç·×¯z¯îÉô·şé·h2w½—õ×ß|Úíîã6xÛ`>wŞu³_/½'÷m{:†ÿ<üpˆÿÿ+ú?g¿;{_¾vkßw·p_¾{\yíé+{<Í¾ûîî?şíıÇ¿ıŸŞ¿ÿ÷ÿöïÿã†·ÖÇwww2ƒwæñâSzR9ÿâ”¸<÷7~’dò‘U|í:	–Ş}8÷ãïÁ~q·ïî,ëreqÌ^Ûº»O—kŞî«Ÿ>¤ßäzé1˜Ñ»;÷ğÕ‡Yøà}Ì¢û,ã^³ÿŠ~{}=2{;íßÿöúìí®ó8Ş¼˜àkL0Iâ‘ÓÖ=y»Ó‡³¢w½§o÷ëÏŞæÃ)¸ñîîáî|ñ§o~8øûC ïî¦ÓøâïÅïo6Ş.ñÃİ³¿ñşÌé§£·¹]ÿ'R®øÂzÿ¶şÛ"İÙ7«_×Şë)°°àîÎğ}øÀ6üõ›<zü¿^ˆõc®óöÜĞD{ı,‰©2	‹Kâ˜xıó ™wï+dW5Ğ ª†U4ªj qUMªhZö@şnãız6D	ªEt,$:6!1	Y­Ó9í×¬;°qè2>‰.ãè2 ‰.³à#ÑeÖw$ºÌrD—Y½‘è2‹5İs¨Õû&0³İI›ÚÓ~ÚíO^ïäıªOÍİ´Üè
+½Ğéy”—D s^ÙbG¬MmíFÿf4DÖ³ÈúóSızû§Ş“ÿé-@"Ú÷v¿xÛ …öÜÍ&D6xŞéí°ÃÓéƒ÷äøïa*6Ñ­¿óz»·—Gİ|u?¡Ñòvdö](¢,
+W…vßNÏ¡ÕøJıâ®{„5ßE[¾õú¼
+‰ôæoÛ­‡Dë{‹hécƒˆŒ>4ˆÈè#ƒˆŒ>0HÈ‹E15$NÅÔSCâÛY?±øSCâ[L‰o15}¾}ôO[/†ôåsw‹íşˆ±à}ğ?íÜ  Ğw7qÎ´÷ƒ{p?Ü×ç^˜Ëf^Q{œù~ó[ï#†O»RÂŠë#YoíïŞôš¢†e\WzHæu¥‡d`Wzú&ö]&‡Ú{<óáíñÄ5ZyTğÁİ¾Z}ksOúv3 Ç?ÑÌ€OAƒ¿ÃÙ÷H¡Şm–ú»ÑÒ7«ìª„:½˜$Â,·ûõgœeøıo¯Ş!€eŸµ)9ûívÿÅÛàQüp:ìÏº–4yË’6ùÕËë³{ô	yW¿Ü¯ß^B©}ç¾j¿Ğ[×ßáÈmõÕ‹ëo{xÄûß}Ûû¸afÈ‚óıé´A£gÿá/Şã?âLp€àİoHo;CJEÄ>‚“9SÚo(a¦¿óQ|hDï?{¿=îİÃ‡Úï¼Gää!Qüà¾¼n±l+X¿ëB4ÑûÙ=øa^Ë¨>¢K¤oõÖúKİ÷ûJfèÏo§(ÿ…ºúP(EN?LH‘Ó"iî!Ô_„—M‘ÓÙ9¬—]lİãÑ_£½í…Öë^èa¿¯>ø‹éí·ûÃÓÛ‚h¼Dcá~ûö²;b¾qDñ…#zØï‹¨2=„”\DïOƒ&Œˆ–$"bXbˆˆaÉ "†* ı:	búÛtÄô÷êœ‰!… 	bXz†êş‘¾ò$ˆaéYDKÏ"bXzÃÒ3{Ùó‚ ÏÅ$Hbé\‚$£Ù¼—×ıÁ=ü†Drµõ>¹	Ò3µû§°Ša¿;oâÆgßO˜Áö™–ÿâ=¢M-¤…9/„Œ¨»İî÷H¹µ›Ã‰L$‡ÓÂÇ¢úí)ü°u×Şó~»ñ‚wÊÅË^İµÏ¦Nå?–|ëz>õ><_³ıI2£‡Â'/€=õXñ€<¬œÇ¾ó6şÛËe¢ìîÙ‘-ÿ0³Ev4(~øI¤J>É9*~ò%§K>É9‘|’Ùì;Ê³‡¥{øÌU„qş\1@ùÆ¹æ/s‡ÍS¤ë“<çiQÊTz³õ:üZÀJGÎfÄÏËøy+SQ1'1i»“È3°½_ü#7G]ğıûº{";œ=^9ÿåmb>S[òE]ßÓîèõ¸tlùW©UFÌGéåFLBzİ“^€Ä$¤V"áãJK’˜ŠôÚ$&!½H‰I(¯V¬GP[­ØçÕV+öyÈjÅR¬VQ€˜„t8 &¡l¨,	eCÕˆÄ$”•yd¨,eCeI(*KBÙPÙ LÍPÙçÕ•}b¨,ˆ¡²T”•%¡l¨,	eCeI(*KBÙP±½ğq¡²T”•%¡l¨,	eCeÊ•}^ÍPÙç!†ÊR*KEÙPYÊ†Ê’P6T–„²¡²$”•%¡d¨Ìã Ce©(*KBÙPYÊ†ÊÔ+*û¼š¡²ÏC•¥1T–Š²¡²$”•%¡l¨,	eCeI(*KBÉP™ÇA†ÊRQ6T–„²¡²$”•)°W4Töy5CeŸ‡*Kb¨,eCeI(*KBÙPYÊ†Ê’P6T–„’¡2ƒ•¥¢l¨,	eCeIäégü‰R´Í¾¯õîØW¨ó9OêÇd)w*‡*Oê2+1-ùZ„ù~ÿ¹Ç-<´my"şãÖßG)êß2; ş¼HVø€ÚxÈ¾J¤uçO¦L7È³¿ÄƒÃ^hŒÙ§‡yæ—xztİOÈPœøXL!Ïòú½³§åryKj‚8·>È[QÄ©õAŞ‚š£˜‚’<…dÔ+&¥,a1)˜¨™l ²¨Y
+ª¢f)¨Šš¥ 5C.j–XÔ,)˜¨™|’²¨Y
+ª¢f)¨Šš¥ 5C.j–XÔ,)˜¨YW¦*j–‚ª¨Y
+ª¢ÖtÈB2pQ³¤À¢fIÁDÍ`ZeQ³TEÍRP5K$j†\Ô,)°¨YR0Q3¨HYÔ,UQ³TEÍR ‰š!5K
+,j–T¨#Ôœµ’„«a‰ÕrâAµÅ9ñ  -%¢¥ ZbeCKI¡ÁĞRRz0´”#-1ò„¡%®`ah‰+aZ‹Z-ñD7TZâ‰Z-	E­†–rE­†–rE­†–Ä¢VCK<Q«¡%¨á‹3-	E­†–rE­†–rE­†–Ä¢VCK<Q«¡%¨ÕĞOÔš†–rE­†–rE­†–Ä¢VCK<Q«¡%¨ÕĞOÔjhI(j5´”+j5´”+j5´$µZâ‰Z-ñD­†–x¢VCKBQ«¡¥\Q«¡¥\Q«¡¥ï‚G|„–?^ÜÃ©‡×ì½{|>¹úÍè~Ú¼ã~û‹·éá¾ê·Joyÿ%uÜQH;:¡+øı)àYØñ:Qİúf“<ˆhsn’gÒ‹^ŠM8ş<ı÷á`êø7OëÑÔ~:ÿ*>Ìé‹¿Ù	«yûmt]ât§óùQW²çKÇsIbp5lsóã[x8—Ğ¸‹¯¼»³Æ‘Z>†Mœ¼ø(%÷éäÂ†m1•¿®/d·ŞÓ)æZ<Õœâµíôò†w¢ËŸ½Ã.ËÎŠÎûŠÔLVãoÇ¬ú½¿vuV7Ğú?ïxÊ¹%r®‡F†ZñìÎwoKÙå7S€®ö¼×ïãßô9¼³wÌ¨òEW“¤¶Æ"ÚŸ;:}ûË6%;	…İú~¦öz…QØ¿ÿíÿşıoÿïïÿú¯ÿÛÿª­ûW®Ú†—EjŞªíŞYçÿ]Y%¶GCg­yÑ ‘#
+4-rC·Ëá^˜€îã£ÜrOtÔê¨…©£–„¦A•j.«jÛïÚœI¾©mVIG%!(©-TRSIí6(©EJÊ(©¦ú„ê7ÀT¿„úİ"èfh£İ	môÏÿ[‡n…º9ÄÔÍausĞRİLéŸ5°ÑƒdÜ9~BĞÈ‘P#G˜9j¡F[ª‘9ëcõú9êçS?Ç-ÔÏQ÷ôsğşÍêgxšİM;?úá)éÊ9*çS9'-TÎqK•S_s¤	<ş€ ¥S¡–N1µtÚB-´TK—P,^Úã®/çL\T8>!îÚâìr>\ÎG#Á¡rÅìƒ3~Ğ+Ï‹Œ%”íÛñ´‰¾ñ^æüãŞÍ´2¶Êå×B=±m~uğFıÉEÚZïîD<K¾ûùÇºï~¦bÀ»§¾ÿÈIş\„ üèóVşÒ,·ğ¶f4óãO®æXŠšc!iEšcÚ÷—\=±õÄFÒ›ô¤ºO |ˆ*õ%ÅıVWôçÖ ¢Øê¡“‚O‰º?Ü	#ê0œ¶„®äŠVniÆôn+»–9»i†–&]®•T¦ËÏuõézb®H¥úT)OVŒBõ‡Œ+p\Ñ@G}ÂãcÃ $ÕçvÚ,@ Q½ëö7“BTyQÙà,q„°®­\‡6ˆ²±Gâôc,6ˆÃu6$£Ï‰ÓúZqÚwîú°W°è÷`óHò*¢ç“5ÙÓMşÚº;øç÷½¬­ñ•ÒsEQïyI–F¿Õåæ¹Ù½€›$êÍYç¢?ü¼œ>f(b†f¨%Œ;æöÓ¢Ü}+¹ê1TT!’zI=jİ:’«#E¥!)Åˆ”Â İ¹*2VT‘1’ŠŒIELÙ@‘«Eı˜ éÇ„ôÃ¸=¹Š2UT”)’¢LIQÚ°àÃé°ß}b³–çËºé¦Kİ¢’ô“±=ôµ®}‡³/v½¡ıj~R- ¯71VÁô©3ètí?9¾ˆ96„9õcºs«i¡îdÛcëªP92yÿÊ¬,z!l¬B>1Í¿µmòmÃuº5èÓíº|²!|:¾¸ÛíÂ}åpfñ0|8sÉ­_~{b‚ó×)Mµó‹mß®Í0]ÿ¤Ë>şMD¦†mêÏŸ¢³ÜL4°×f£ÌF[4÷úÊ‡È\vˆ¶ş†ßÂï,,
+wâröŞ’{oû–\oıGïàFíJ>¸»c"JæÜ¹EËßùëÃş¸:õş‹ûŞó/‘òìà_Ş³Ì²ı+ßXµŒ¿Š÷©+w§µ¸ôYüÑ+f=+«bIAYueKt±ˆ#U¾óµ…‹¿É„í[Â‚ÑOİİ§àÉó¿ãuqÆ!oî6>Ê]Á¢µøÉrìr½ˆi›½ôÄ	÷Éÿö‘h·|(y‹ÍX:(ÁÙuÀgÒ7»÷«R‡Æ2INhŠ}µ¤ìEEwÙ‚[§!ÑEiÀ×©´û„'¦úœ¥½¯İ‘%p;»M¼Á\Îñz‡^ğH/¹)]E‘“¸€?A%”(fĞ]›“íã—<¹Çøÿ¯:¿õÎÉ€×ı1<**^y“¿äïİ~2Áâ6šé»»İ~ç1Ï.Í´£G¦ñŸ}äş6#98L7kRV”’
+ÆJ(kå÷û8jàôÁë]n‰’,*Ğ¤¼&yBQ<³{àñÁ³7«ÖˆŞ6¦‹X)—ëÍë|sö§Àñ^~§Â×û=,áì5Ô{ˆôbI]Ã‡XcBZkı Úğõ§aûÜùŠİpÕıôNtMõOí¦Y€úŞB¥2x§»8qMr·Jd@jÃ ÖE@Ncl¥såg4nÛ×³LKì‘¥ÇòÛWBZææD®"n¯Z~*í¶^ÌÉâÖ‹Ü=õÕrRU_6è‹mzş¶İz–F}¾)ÁT$®ÙÖèiúâÚîí%şTºÍ´êî}s}úÒÔïú€äêP¢éßøË6kLò·¸acyü¬¡ıø»t¥‰á/óXÙEí›¬¨¬—J*j±Ÿ2€¿–™ü=çÑùìï5€¹“™+PŞóÍê”7Y>¦Êß¡ÉüD	1+‹tø;2“¿azÒß½±ğ<bğõn}–
+^ó?WËIÁZp¹]ëj `fõ¸5ÉLá_™Y§é˜É°åsó\‘œåâË­N™)_ÖØ £Ä?æóèVô±ãòƒáù¬ ÜïW©úı¡¥øÄØš¨=aÙÅ'&ßáROØƒ¡â›‚h¬èÃ]ãÎtÖÆ÷¤¾g¾ZÅæø6%¬Á¨üÛÔy~v‰HìÌ×LÎßj+ŠZ)??3_fe¿h3T¢‚!Ë½T­
+™‚3ÕŠ&>ô`úøa­	Ç=NíhYˆv\ÿ•ö•˜ê8z"ÚìöoúÍêŞì=çl	Nm.kCR4Gá9lÑİ^Ş¾åÔ=Ì‰…ş?Àñ½€ÿ¼™X?ß8VRNÃd¶Ãññ;Äù•şâ=
+rìıCpï«
+‰'£ñSfRNÄğänÌu©M !±ø‘øœÌhÉ\–‰>ú/Ş±÷½÷¥÷ãşÅİ%âÎ0(È^ÎúpáÇNÆ‡ó=ãÃƒKR«Î.ÊrÄµ	]ˆör÷
+Î÷ìİv|‹Å®bâyÂSe3JÎ8:u6ÖCşF?ÑŸíéqoŠ{Ü.¼íö;÷ü¯ık@ëKo'½ù5áBt¾€4Îı«g<9-1ûôdî¯“”àgšƒ:øv™ŒNônñ¬?Ézw‡1wÅK\’«óı!@ÇW3ñB\¬:><¤xzV©È=}‘èa?X26Ş{½Ç†=~Ÿf?L¢s¹ÃÍB<{>´ûr¨M—ïr…å[ÒúåbjÓı•NR9£â?î¿ÌİİæƒÿûõÍúW=~ÿBRÁfœİ'§»¢B½¸½ï‡«J<ù‡ã)àĞ]Òwl2Í:çŒï.ŠÍ3¢:óy_Y—Êîä2³ó·¥É ³¬\‡Ê¬™ë?g®ß§øqáÒ}R±n]’jû¤k0Õ;iÈê
+:ÑÇ`=íÿìÎ[%
+T‚+@|^Ò|¾ú k>9ãkŸüí6¬´ÿ^ÕÃ‰.¦İOxíÜüÀ~º%+Éˆ=ï÷‡ß;Ïh´òÕ,Î×äF-½ó¯çÊ—¾ Îµ¨=€ÉÏŠCÙn1P–Ct,
+dH²Ì4:˜YÚKgµÊxë¬3êr8ƒÊ Í€†·iˆĞğ÷•ĞLöÈğ×AÕYíM~·$p@#Û€ÊrˆÛƒEI–šF4+'ğØ7·“ô×é«]hP¤Ğğ6îrşşİÒšñhjÙşcĞLçóùpš3gX@#Û€ÊrˆÛƒEI–šf4£Õj9äúk;uµ³&ƒ4^!=' áWÔ—ĞÁt<ã¯1·ÄYÍäa4˜Y9s†40²İh ,‡¸=èXĞd) it@³t–“Õ„ë¯©«]hP¤ĞåšaµİŸ¦sşs‹Í
+hóÙb1Ê™3pˆl7(ËA;-€cQ@C’¥€¦Ùµš9éÍ ¬3êt@ƒÉ Í€f$ĞŒªhVöhñ ÈĞÜ–³g<ëâĞÀÈv# ²âö cQ@C’¥€¦Ñ³\–Ù¬3êr@ƒÊ å€Fpf_ÈáÉ}2‘K¿(r©)ĞĞ¯ü4·"»¨É@+«¼3Á¯ıÉ¾ã£»şüé°
+N¸›Z-¤í6ÃÍdm¢ê
+ÖŒ8c³{TÕ§ÙRÚ–(^©°HŸÔ«ŒŠdVµÌ@Q]AázÔÕX»jİÔ0£.ÖìÊõ"mli=|má^†ŸéÚÍ|R:¥òuÄª(ğ«´©©Y= É®LÙé‚¢‚ÿd ¯öç‚ëÇ‡ÑhPk ˆQOlvÅ‘>¶´@m`†Ÿéš×‚R:¥vÄª(¬´©Y= É®LÙé‚¢F	É@Ş%ÁÔ@£ÛìN	EúØÒşµ‚~¦k…;Jé”j Ø«¢@°Ò&¤fõ‚$»2e§ŠL$Axw	SAŒúu³;LécKûVÔfø™®±îH (¥Sª`G¬ŠÁJ›šÕ’ìÊ”N (jÌ‘á]9L1êşÍîÌQ¸U¡ı>êÛ#˜ægº6½# ”N)ïì†UQ XiÓR³šö’ìJ”N (jh’áİLL1ú%˜İÑ¤H[Ú'¥¶@0ÃÏtMGA)R;bUVÚì†Ô¬@dW¦ì”Á?ü  ŒnAã>ËĞ¸ŠÕUifZ"¡Rı•ª‘±éÁÙïNÇÈqíûÃ—yw÷âşux?xRyÿƒ{ÇÜğìè»É›«øZÄ¬ã)qgîoüX¹4»6›M¿»µ«»H5H£‘V@Íºb<e Ê‘›oÒmdP›¡r:ÉLGf
+ÉÇÅCø÷:X²1aòZ5ıVI#š€”ŒÕ3‹ô¬z†š´*huşD¿Õ©Y,ê¸¥Z”ÍÒ£+¶µækœh	©çµlHÔWŞáŒr[Ôç‘Ì!íÌÏu:ËÕ:·dT/År³]$;Ù)d#–öÒY­®Ã¥û3'¯ÖŸ÷"İ0Y¬s(90Ò9“u®Œl˜¨ßo2ï÷kj6ŒÚB©eÃôèŠí§Eı‰Û;ZgBêÙ0$’†ÿ•·y¥l5»&sHûósHÎ†µÎ-Ud†&dÃHv²SÈL¬œ¥½ä·¤K_­?Fºa²2XçP²a¤s&ë\Ù0Ñ¡ÉlüĞS³aÔ{Jµ(¦GWl?-:¤¡°£u&¤C²!iø_y¯{Ê†ÉgÃèÄÖ›eÃŒ3Ãö»¥ŠÌĞ„lÉCv*™‰Ñjµ^‡KŸÔ•¼Z6ŒtÃ<de°Î¡dÃHçLÖ¹2²a¢“Ÿ’Ù0øÉO¦fÃè 
+(Õ¢l˜]±ı´è¤ªvÀÖ™z6É†¤áåşP6L>FÇµŞ(fœ¶ß-Ud†&dÃHv²SÈL,åd5¹—>®4yµşlé†yÈÊ`CÉ†‘Î™¬sedÃDÇ_&³ağã/MÍ†Ñ)\Pª…}Ã´èæT·ç¸ÎvÀÖ™ oÉ7JªúÔCÊ†)ô£³_Ûn”3ÎÛï–*2C²a$;Ù©d&¬ÕÌIwkJfP6ŒtÃ<de°Îáô#3XçÊÈ†‰Î OfÃàg€›š££H¡T‹²aztÅöÓ¢3ËÛ;ZgBêÙ0$’†ÿ•ıLÙ0ùl˜”pT³a]t)æšeÃŒ3Ãö»¥ŠÌĞ„lÉCv
+™	g¹,³gú%F3(Fºa²2XçP²a¤s&ëF6ì;oã¿½|xv7ÁÙ%Ï·{ñ}Ó$mCó`ƒ‡ğoVéS]ÏvøøUx¤1Š²Á8£$‡q)ÜQ†1Œ‘©¯d¸¿î…Nô'ûÒîúó§Ãş-ˆ"î° ¬JS¡Ç×Á¡AfrÉ#¦Uc€j2WèI$	ñ¨¦H5…ª©ü)%£O´uæ»4:¬h2êœû2´^ÏÆÉúÇ¯›0ç³‡EŞñ_(!3Ú(Ë8Ú8ù+;Ú0E3Ò@:‘	+XîQÑºŞ+3½ô•	¢é<ó:””‚i#5-œ6ìĞ\#jöìVQ@?ÁÕÔ€záŒçcAÏÄ[ñ¸n@6JÑé-Xãç‚5Lá)°8Q@-d0MTîi“úé ÔôÒÇ\u$ ¦#QëPR
+¨8Î´€Ú°s÷Œ¨ÙãßD5ü8Sê¹½XLm—n­èuj´Q
+–s´qò×w´aŠj¤( 1˜N7(ùÀ*]ÿ•™^ú¤ŒÔtªZJJµ‡ØP›ut‘5{‚Œ( †Ÿ#cj@=u&³¹`©ºu³Õ¨ÑF)ZÎ±Æ)Xß±†)<™g 
+¨E¦É%Ÿy¡ë¿2ÓK7ÛîH@M³Ô¡¤PÑß´€Ú°îÿFÔlzQ@oEoj@=,–şRuÃaÚ{¨±F)ÚC5NÁj¬a
+÷PãDµps&õX,·m¶öêôôÒı:;PSo÷:””j#ZéP›Õ@ØÈ€šíc+
+¨áİlM¨éüa,Ùn+˜n@6JQ'¬q
+ZÛ`SØg 
+¨…¦6MåvŞÔõ_™é¥[~u$ ¦ö°u()ÔFtã3- 6¬¡Qua1"¼q`hü|QQø‚å2ÿqŠÛ lOº¾«MhÉ"ã¢2†FıÍ²j’RŒÄ¯ôÃ¡¤œ
+¢Vˆ>cUgÑ³F…¬TeÕW†µNdÈÖZ—¬¸ric•ZÏ›Ç‰å$ü›³*$ï„ñWğÊ›	znÚ|wŞÂÛnu»w·#¼PcÜ—+ãxœB»º±•lEK¿ƒ"-[­³H•]Íë„GpKø·'2t{%ÀU
+k	räjwAË<ŞkC®âÏZú=6	räjE*øªöJ$È…%|‚\º½ä*…µ¹rµ;È Èeïµ!WaVK¿+A.‚\­³H_ÕÀnš¹°„O«q"C·W‚\¥°– A®v¹Ìã½6ä*ìÓké÷é%ÈE«u©à«Øo• –ğ	r5NdèöJ«Öä"ÈÕî ƒ —y¼×†\…œ-ıNÎ¹rµÎ"U
+š×‘— –ğ	r5NdèöJ«Öä"ÈÕî ƒ —y¼×†\…½¾-ı^ß¹rµÎ"U¢îæõl&È…&|‚\¶½ä*…µ¹rµ;È ÈeïÕ!×·şQÜ¦0¼©ÑšpX„­xªé«B²mlR	ªfyó‹u@®Aˆj€¸˜ƒg¿;Ãhü¸öıáÈïî^Ü¿îïg†>‡ÿÁ½ã±Ãìè»É›«øZôfÇSâÎÜßøÚÁ\IL.iI°S<õÁt¼äMÎB[ÛŒRÍfÎÒQî£7³xÿfâ±ë´Ë?m¦‰oQ¯à³ÖoÜJoœiyÏïÒólv0²ä‘ÑØØŸlœ‚vÎ/·Ex‡+ÛKgµâæ¹LóÎ¨SÕóÏÂÆ’iÿï*ÙJÿœé•²n|0²äŸÑØØÿlœ‚vÎ?·Ehşyån_m•¾Z¿Fªv!Kûgx²VúçL3•”•Øpãƒ‘%ÿŒÆÆÖøgã´sş¹-ÀóÏ£Õj9ä:=Û4ÿŒ9U=ÿ,lY“öÏğ~5­ôÏ™Êû”•àÆ#Kş­ñÏÆ)hçüs[$€—ßv–“Uv/`bâùgÔ©êùgaƒ´†77h¥Î”i¦¬d7>YòÏhll6NA;çŸÛ"<ÿl­fNúómjâ&ùgÌ©êùga1lÚ?Ã+a[éŸ35=)+ÁF–ü3[ãŸSĞÎùç¶H Í?;ËÕ`™İ˜¸Aşuª0ÿœ¿/¾l$ékp	‹`…ÉB@sk=2Å…†–¿LÈŠ•õøûâ˜¾¦W@ª4%Xa
+øÛøÉ HÃgê›”@jfT¿—Û£}çsIrMå{2~Ôd{)> ¥êŞğæu/*Âê¶±'Ñ+B`+õ1oZ"“ƒu@ "U@jé"©»j5×UçV†ÔU`k$2‘ba“
+‹ĞI=è*»¦r¾L|‚ãZªòG(õ—pQÊg¡J)ø\¢_FO(¥îÚı\¯dTµoQ8RW›#QŠ3¥Th\„RêA)PÙ5•óe¢ĞR•o8J©¿‘…á(¥|J¡”üf"–~3B)X(Ú ×+Õó (©«ÙŠ‘(EŠ„R*4.B)õ ¨ìšÊù2Q
+?h©Ê7¥ÔŞÎÇt”R:ƒ¥€PJ~K%K¿¥¡,”mÒ’ë•ŒêüRÔÕrÊH”"ÅB)¡”zP
+TvMå|™(Ç´TåRêojf8J)ŸA„R@(%¿±œ¥ßXP
+Z]
+°UUş>d“ú_n@¯©ñ‘(EŠ„R*4.B)õ ¨ìšÊùRëRPüAKU¾é(¥öÖ¦£”ÒD(„RòÛkZúí5	¥`¡hÃ¾\¯dTÀ¢p¤®ö£F¢)fJ©Ğ¸¥ÔƒR ²k*çËD)8ş ¥*ßp”Rƒ[ÃQJù"”"Rştğ7ÂŞ^áM–^ã"PR×‡ˆ‡ğ/‚\.uïñ	ü]gŒ¢:Î(éIœA2«K¹Ãü\î0y`Gu™Ñix(­ÏÚ¤Ù,_‰( H4=í·ğXŒ HZİ&á_Iu×Ø}q¢@·XÔúòìõ[_šê'ÇóÙÃ"¯ÇŠ§D¥ÀW¢“ï-Ñ†)ò—È‰=&Ò@˜>S¯WË¼¦T+>ò›šîh6ÀUZåêôœ¨SÕóÂ†liß	oÈfªï\8ãùXPÓi©¬Îùım°F)êÎ…5NAë#¬aŠ|'ò@bß‰4¦ïÔkÓ2ß)Õ Š|§¦CZ:³ñl$­ruúNÔ©êùNa› ´ï„·	2ÕwÎíÅb"¨4²UVç\ß‰6JïD'ßw¢Sä;‘ûN¤P}§V³‚–ùN©¶%ä;5Òb¹\ÎÒ*W§ïDªï6¯HûNxó
+S}çÔ™Ìæ£¨¬Îù‹°F)ê·†5NA3+¬aŠ|'ò@bß‰4jÎV«„¶e¾Sª˜|§¦Cš;ó¾`§Oåêô¨SÕóÂ’ê´ï„—T›ê;Ç“ÅÃrÀ7Ê¡Êêœÿ½k”¢ïXã|ïÄ¦ğ{'î@9ß;qBõZ…]-óR%ä;5Òl¸®øŸ	x*Wë÷NÌ©êùNa¡_ÚwÂıLõÎtş0,š#•Õ9¿nk”¢ª/¬q
+Jj°†)òÈ‰}'Ò@˜¾S¯Ü e¾Sªğˆ|§¦Cræ‹ÙŒïx*W§ïD*Ìwæï‚oš¹Jª‰ÇÛ—¯êÉa$Ü6Œh¾†Ñ,rÈ:TÅŞBµÑ¥,Zv[0W£ğ¯ä;ö§Ê+{A€÷Æ¨U9V¾ùw¸f¿ê—ÿ7^¼ñÊñ»‹42WH.Ì’ı‘]ÒmX Û†º¶{Üÿ¨÷ÏP+FÙü®¿†ˆf¤ª-ıªA‚7XğFª€J¹ hQÅ?lA‰?jaM¿İœ"~]Ô/rÕW Öv–åğ÷ìÜ!¸CpÇ!ÜA‘Ër¾
+6Z˜xê/HV‚<R. z`tÁ
+R>×›|
+>çè—|ğA+R—©~U®I-*A’-¨8R-,0×¢›SO¢‹ZW}ùxÀÇ™¬–«¥ô[ği@lGÀ§B àƒ#k9_Îå—õOıİ$”€”Ë ]82.ëM>ùı:,ı~|Ğª¤eZ(E‰Õ@É”<©V8kÑÍ)hÑE>Õ÷ş¨øèÃÏoñŞ’€Ob;>-¹„…µK~¦‡»¬×|êo¤|¤\6 øÀèÂw@–Îõ¦ŸüfK–~³%>XÀGªïŒ*ğ- >P²ùÀJµhµÓ£+^í`tQ·ºUß¸©àc­‡Ÿßâ½%ŸÄv|Ú(>8Àg¸tVü¸–»¬×|êïã¦|¤\6 øÀè‚¤|®7øäwÊ³ô;åğA«ñ‘i¦\ã$ZTã$[Pã¤Z¸±W‹nÎÆ^]TàS}×½zj|FÎTú-	ø4 ¶#àÓF!ğA‘Ër¶Z9¶ü²^gOíM8Õj|d\6¤ÆD^ãS:×›|òÛœZúmN	ø`©Ê}XD‹Ú®ÉtYR-lªªE7§‡*ˆ.&ğ©¡ej_|VÎ@ å½%ŸÄv|Ú(>8rY®¦K~¦‡»¬×|êï ¬|¤\6 øÀèÂ¤t®7øä×öÀKz¦E8§.Ôæp¬xIC‘ƒá"ô Aº AhP.\:diC–0mL4QCWh?/(æ
+V´İj+²5š‘(DBìE3±fRßÑdÓ§4Ækzş¢#Š^³+ÔôÒIkxFT„D^ÛL‘x¬Ç••‰¹DÁ%(|2Õ©è*‘Q=øI³o!Êªy5˜ˆ’:^ÀÖ?^€2SdºĞìQS2Sµ4ñodo¢QnJ ñ™nÙi§ìe§HÕ)?ÕàüúúfŠÌ)C…*ZÊQ5Õµèª‘aÇ¦n5
+ê6#K…ªãzyªüÓ`lıÓ`(OEÆÍ%5%OUË™+MïM´#ÊS	÷¦7Hk<å©(OEªNyªç©Ğ×7SdNy*TÑRª©®E»K‰Y§\‘n5
+ê6#O…ªãzyª‚?ıÃ»(OEÆÍ%5&OUÇYMïM´#ÊS	4>sMZã)OEy*RuÊS58O…¾¾™"sÊS¡Š–òTMu-ÚéN³%$İjÔmF
+UÇõòTùg-Úúg-RŠŒšKjJª–›Ş›hG”§h|æè°´ÆSŠòT¤ê”§jp
+}}3Eæ”§B-å©šêZtÕÈ°3dI·u›‘§BÕq½<UşÑ¸¶şÑ¸”§"ã…æ’“§ªã Ú¦÷&Úå©Ÿ9é1­ñ”§¢<©:å©œ§B_ßL‘9å©PEKyª¦ºíşTfùMºÕ(¨ÛŒ<ªëå©òO2·õO2§</4—Ô”<U-ç…7¼7Ñ(O%ÒøôÁ¼i§<å©HÕ)OÕà<úúfŠÌ)O…*ZÊS5Õµh«Ñ|1lËãÅü”§j¡nµ=O…ªã*yª¥{øü­<1É©ğF/ºÌG/:"ÌGÅ~TÛã¤´´ò’‡Ú‚hÇõ"ÖŠĞ/Z|¶p*Wáx¼”‘^ß“×><»ä¡Sh®3àsW FŠãQ]IœUâ1¸ùÆé[G;Y	@İf%$à.}<µO–îT*}hÅ ƒ¶1µ¶3â¦(´(Ô)¿¦„âĞ¤yt'­Š™ˆEq™©²gH2Ñ(øüÈNE£ÒGÓP4JÑh£Ñ‘e,[` ÖĞ_z`ì¼@(m¼<ºVÅÌND£¸ÌÔˆFÙ“¢˜h|JT§¢QéôR4ÚÆht°õ-~b›·¤Q4Z²@Æ£©eËôy§h´-òèN4Z3;â2S#eÏƒ`¢QğYŠF¥ÛÌR4JÑh£QÛ±ûCşçoI£h´dÁt<“E£—Gw¢Ñª˜Ù‰h—™Ñ(Ûõ™‰FÁŸ;J7“£h”¢Ñ6F£ÖÃp2€¢Ñöö'ƒé\^ 6^İ‰F«bf'¢Q\fjD£loG&÷uìT4*İ2†¢QŠFÛNÇƒñƒÈ (­>]Ù£Å?ãÁE£—Gw¢Ñª˜Ù‰h—™*ÑhdÕOoá``‚ÑËıŞåĞP´	E3¡D¼%c	ü 4ú…d`‘©UŠç—Øğj4›÷Ö1ÍÂ6HDó0Œ&Z6!m„şlíû´^hA•Õ(üË“×ÎÛúÓ¢°aÔÛu4­g¹°À±i¶6ğ.q;òWĞ4f:Uæ5¯ks5ì-/Ş@]qkêÿ%§sÓ%YC²1ÏA4òé‰è¤Ó»<ç …M–á_É‰’(;oámÅÊ­óŞKù¥Ô15‡°™Wyè÷ô""A2-ÁRT5@”l>R% ²Z:–Ã/î"(BP¤¥PÄZc~•60¢·îâíÂ*_œHL’$™O‹•Ì\ë%³ñÜY®¤§J°–°]İD°ŞÜ`‰4,‘¢ªK dóa	”*Ág²Z®D- 	–,i%,­…ÅßÀmE°¤Œu¯ûBùâ$Xb’4Ğ`Éj8ŸÌùeE<÷W',Y:³ñŒ¿ç”7U‚%8°„mï'‚%ğ.­„%™*)ß0 Ã’L“ÀUK dóa	”*Ág ~Ææ,v„%`!XÒRX2\‡6ÿpn1‚%e¬»xm8Ê'Á“¤K–£•=—i'X?,Y,—Ë™üTñÎÄæ‡ëlÿCQ¸oƒØÊp]jÍT×¥bõpJ6?\‡R¥pİ±VÃÏM8‹@#Ãu°P¸ŞÒp}°°ç#Q‹X
+×¥Ãu½u¯ı~ùâ¤pİ$i …ë‹ÅâaÉ?¹„çşê×çÎ¼¿ä£ ŞTé+,aaŠ`	¼f+aI¦ÕPÊ7ŒÀ°$ÓN3Eu‡%P²5@ªKVKgäğ×å!g±k$,Á’–Âk<šù9n¿=‚%e¬»x»üË'Á“¤Ws1Z.Wü’Cû«µæb¸®øh7U‚%8°„íˆ*‚%ğÆ¨­„%R¾A–HÅrê°J¶ -$*ÁgåV|2â,v„%`!XÒRX2Güh„Ûx‘`Ië.š©T N‚%&I–8óå`Î/ç¹¿:a‰3_Ì‡€ò¦J°
+KÂ3ÄX$ºÅVSğ‡^ª»ê>§¥®Åh6XháËteÏlş
+Ë­j[¯K3JÅ·eg£:JôÅDd;zDÎ‹ó‘0TÑ'Ú÷‹‡ğ¯äêeã··WÙéü‘¨7Q¨›,îâ˜<ĞŞÂ±#~³ú¶|ä9És’ç$Ï‰â9—öÒÊšæ;—óÕĞéËOµLï™Ól,é=áÆºá=kèEŞ“¼'yOò(Şsåş“Ÿßå­_uzOÇZÎ—üSt¹S-Ó{æôÄIzOxCœxÏê›œtÍ{
+³š(T•î=3JyÏyOòMò£Õj9”^¿êô«™Ó_ò
+wªezÏœIï	ïOÑïY}Ï®yÏñjº(´Ì)İ{f&”ò6yOòòKg9TgğÖ¯Z½çpé6,s§Z¦÷Ì©¤NzOxu7¼g¥±]ó5¶UNš/İ{f&Äî&ïIŞ³)ŞÓ
+!ôúUëwÏÙjåØòS-Ó{æü%½'¼Ú¯Ş³†
+®®yO{0YÎøÉ%n¡uéŞ33¡”÷’÷$ïÙ ïé,WA0ŞúUëwÏåj*è­Æ*º÷üÓÁßˆ½ftê,í¦8Ëè	E+¯†û>=”–—ÖÙ¬òÑyë½ü†Ÿèä¬Åqj^O¹ÌÀ7.¿,XúU3ì½jE<ª¯»¥×Ìšóªh©“‡ğ¯¤şj<Ñ|!âD¡°¸ú$ü•~õ	¹ÆR]£Ş^ìúœcùÇˆ›çËgƒ¤=:SÅlƒ‹¬àeÑœäl< ˜´Öé&Q§ªé(s
+M’^hB²ä“Mt¶]×ç(Ë?ØÖ<GYş;ä(§{dó£n]P£e/‹wv[éç4›y¤´¦£Ì©)I:JxM	9Êr{íkí°®ÏQ–Ô¢y²üw6ÈQGSË–yÙ68Ê
+^ïÔ$Ì“CËu”µršp”9å#IG	/!GY®£ÔÚL]Ÿ£,ÿ3óeùïl£:ƒé˜¿_™[+ÛhGYÁËâãQú™}f/¨é(s*E’^)B²Üo”Zû¦ës”å»c£,ÿr”v2˜ò¿	p·&7ÚQVğ²xß(K?EÊÌ¯4eNQHÒQÂ‹BÈQ–ûRk‹t}²üƒ Ìs”å¿³Are*°v”¼,â,eŸkbæ,7Gyù¯ãÿ?PK<××?5  t< PK  !LëX               word/document.xmlíÿnÛ8Çÿ¿§ ¼Àb×Ø±ó£iv“EÚ4Û`ÛÆÛ¤Xn.-Ñ[‰TIÊ®÷pÀáaÿ¼?îYîQöI”dÇIÓ^m§Š©~ƒ6±-‰š9Ÿ¡†òwß¿Kb2bJs)íæfƒ0È‹áAãåÅÉÆ^ƒhCEHc)ØAcÂtãûÃ?}7Şe%Lb[z_42%öu±„ê„Jj90Löå`ÀVşi”G¨ƒFdLºßj•5eÊ„İ6*¡Æ¾UÃVqÈqy®Vgss·¥XL•WG<ÕÓÖF;ÿ(‰§û?å¬c©ÂTÉ€im‘ÄÅyÊÅ¬™öæ'(ìÚ™‘~Ê™CEÇs§¼*Èq±ñ²Eı^“31šVŒÒzy+¶½öæµöÎ#š²ËÖ†«µöƒ’Y:m-	>EÛ„ª7Yê,–Ú+Úç17“\ñK¡ÚÛ«IuİfËµ7ç?íÅèÌH‚ıÓ¡ŠöcÛ“¬$Ä©Gl‹CÛ¡ú2œ¸¿iş««ò?çf32ŞÑø ñ„Q×1Û–Û¦SØwvcŸY£Ú&·÷l÷ïÓa¶sm»©¢¥@ÆRMÚÌÊf~›~ºµ;ıä‘¾úY«l¦5LİvÓã}sØ=>!?eL»ÎM„3å<ŸhÃ·§)ö/ù¸­;7‹çLğ1æ¶}¾Æø×Ä:çkÂ“4fnXÓ„’·S½éLoëMìµ%Î2ÓW“Ì96‰&}ÅC¢UAD¾Ù&ív¨&Ÿuvşœ¿Š©ftÈH"Cë&95îô#2{RkäîiŞ~–Æ2÷-w&}ŠÙiß–­jû‹ÙÏ]›VR5qÛLÄ.…j.x}J_î,aÄ+[fÅY'xÊµy˜Å13Å	D–»ñxÏúÆlÛi8ı¬]v‚Ù™Âù…aï±ÿJ
+Ieâ5ï‚&º#-\ñd;†ö¹˜w¾ÒÃEJ&ôÏ3÷C¹§Wº áÂ°¡Êù%ïyC&˜*úZÑó5ù¦èßgqL­º~hyBµ±ƒÉFŸjÎ†çÅĞreäğC¥®£b;‹€9¸:æÚ¥Š¸Ìt<)•´š»ásÆ¥†Ùn¦ÎÊ7à®“^Eã?³~Ñ~ú0,¤–ét×‡bæxHÿvĞØÍ_Xb²˜Ôq¯sh9hìå?E#1˜åîKcd²üñŠ£¥Oßš3íëòï´µ ¶#¨;.•6c¸ß)ûÊÜNõÙÚù	íA¡ãHa¿ĞŞÛê,vDçşöŞbGlíîn/vÄöNÃŸ~ÄÎöƒ5ßİn/¨ùı­Î‚šïu¶ÔÜ^À5oonŞ_ô¢o>x° îíöƒÍ•ow¬ú²u{Qõ·wwnT¿uÙŸ®§[G™‘åg.úÌ¥a—IØûûÜ˜›©é°ŞnÕçGRhSíˆltí£@»÷™âL‘çl|=×jß?×*>ûx7“âzûŸ&X~ÎOHÿ¿x.Ê¤áàJ¸ùÌ¢îÚŸeEİ¨RĞUlú–Â¤·lRışÔÄ›µµÁ² Y€,@ k!k•xğÇïÿBD@D@D@D@D@DÈ#Â¿ÿøıŸöŸ'	˜»)?¢SÅ4S#Ö8$HRãMNä¨ T * €
+7%ëf? 	¤RL •ùCe2Ğ¾¸FË£~°^şT©ÉŞŞòîñ9æ*/šäe@®"È…Õk€ Ë€eÀ2`°X^»@í–+…å¢,ºW”Eûâ#şS³¯°\¬á¸ZLV+ƒ•ÁÊ`e°2X¹ZSÿV®•ûIg¤\ùü²¯¬ìÖ8‘È@d 2ˆŒÂ}DDDDD„÷#îzU¹î[~fğ H¤ RørI·W eu„²é³h{—OöÅS i€4@ H¤ÁÔu55x¸Bîõ¸à¦×óÅ=š¾6 ×ëÀuà:p¸†„©kjjàz•Tzå×xIå‹€ÙÁì`v0;˜ÌfHÂÔwmj¬è­*çŸ~ã‹‹ Ùì@v ;ÈdGbî÷Î¥?dIŸ…î‹Ú=}0Øl6›ÍÀfëlkÀf050¸ŒŠeL¥×ëÀuà:pY†„©QıPG\ŸÍZ÷²Ø/µƒÚAí vP;¨Ô”ÄÌïK¨m,"_œÅà2p¸\.—ÁÔu55Å˜F®×ë¸\®¯ÒøÄ05ŠêˆëÑ¤¯xØókâÌf³ƒÙÁì`v0;@ yçÒf†Çxì°X,–Ë€eÕbñ
+ÍpK·ä1½G‚#Á‘àHpäz o‰)¾
+qgÀcÖój$	’I‚$A’ I¿IáË¸iRaF–P.æVáé„\ı©R›½½å]ä+r(b9¢2!Ü`ø6cV(MB®X`bäõ 8P(ŠÅİ	ÅõhÊAr•“œ?wBµ9êš¦1¨áRäHg"Fìç 8‚Áàª&8ÅŞf\±„Y‘@q·l\óÎ€n@7 Ğètƒ’Úªğ‹ÇGÇÏƒkn{Ú/Ö k€5À`Mm°f•€ğßÿ,æÌú1eç¶İ}ãO¬ÏYé,Ø¼³Î93Yê½¡œøí&y,t¦™ÈŒDtÄHwb")ÈVsï/„mh³ØOìŠè‰6,iV¡¼;C§IÓRÃˆ‘ù¦TÉ×,0eáT“Ê„Ùj’GŠ9Q(qe2&ì+)Ü´Û>X
+,–K¥ÀR.ıÈ£«/3ÌdÜlì„Œl|öÆØŞL9«Ö·›ä(0|”ã¥eË[£ºÅe¹Ùƒ7È™ ?sÊ±Ş'K‰À`0˜ ÌuÌ/†~)Ö€é_hpky|NhpvN¨ÉS.²w˜B˜F˜F˜F˜®O˜¾õ©	m…
+¦&>ûÔÄµå‹Qûş<âÁ›Ö
+ƒwšä´¸UœO£•kB²”‰‰€3,‹ÅÀb`ñ‡oòtZtäûrôP,\ÃE‚ës»MrÎÉÒœåÎâ˜&”äıSUu3ôpƒœÈ8–ã\„r@(8áŞ¨,p¯5¡fŸDÆ¤z¿Õreıf “ÖëDª!mÉ\úê¤.‹)ß3ázöä3jr™­È±hImöÛíí­í)âaïX·¯kHçëä[+ÔÎ¾Ôt¸hÒSnk‰Ó½(¾Ê3JÖ­ƒ¶m5T™©R+uN$XH°`!ÁB‚U³kZjŠG»}6ûÖ`µ”ÿ¢Äˆ1·YwŸ:¢<¦}ÛòM¨ê!Wµ;MòR¬>È“741¦’['«$Õ© #y™Æ’†„’îñ	„B!‚Aˆœ‚ï_x3÷îÍíş,Ã½4 ####×&»øµ»»\`°Í&Œ/·Ò›İ«Øõb’2_Œºï	Å|à!‚IRå{Cv˜M|1ª7e0!5ËU Âá€p@8 |!|¥8ËcÀbı8½Š™ÿæ‰™»Ç'Ä'ÿıµ&7VÊ˜šJ
+xrßg«]Q*î±-–@K %Ğ÷X+%!÷•òøy„_„_„_„ßú„_Ü^]?»âöje3fs_·î‹Å½AÆ×úšQAŒ F#ˆÄè71.»şx€x€x€x€xP›x°¹¹··l<øúm&Í·ùÜrñÒ—$Ìó´·ZéWõ¿º/ÇœÖ ˆ)æ—³Üõ€z@= P¨gÕÒpĞã¡_‘ØS¡ƒtOz§Ç=ÅL¦{%“^±Öı¯V +€À
+`…ÏX±JpşG­Šÿ‹…ÏsÅÿø’Ä;Ä;Ä;Ä»Å;TÿûNNƒqÏİªál¹ïK@$F$F$F$F$^ÇHŒ… ëgW,ÀB€Ğ#€AŒ FcÍˆnk! g5q5­‰óè™‘«ºòOÓå
+m¿¼ù¼ùœ¤'©©“¬ôm­Íæ¯X;„D	‰ÒG QB¢ô…&JX;TkhÀÚ!`°X¬ V|k‡X¯°—pkÁæ/2!œ×˜ˆ‘3;ÄsAcr(šuÒpéÕQ’dšåêÉ©z:WŒ¹‰dfòmGİÓåVK-!R»Iº±•dâÓ2ıÆÂE.Iªäk¢¤4$äÊ¾–jÒ¬J¸N“<“!Lra^ÍÖ’½"1×Æ	ù*¡\4ÓÉ+b$¡ahíJ‚ˆŠaaåÙN=2¦Âäûé7„ö§Öv:‡2È&Lešm5‰uöüüNƒÒ°F\®×ëêÃu«”Ş¦"¾Ì5«t5Û®R–ĞÜù¢šÏ‘XÉ¬3YÂ´M¬Ó5yjóaÇÌ'YRìÆãQ<sÁÙ¶Ópæl¥¯ÍXÈ"§ƒV™d&ì8IÎR&u7‹©a!aJI¥ïå´ëøq ãXİ sÁ-¨¶Ïlz‘'SrP²}1˜¤‰Ç1 5š@M fÍPs:º-ŠC<I¥ªtèíßä“x²‚‚‚‚Z½‚Ú²9şµ€€i“ÕMÊÄˆ+VÙ{¶îàÇgİŞñËîÓÓGG{OOöÎ~ô«NìWOyêÄV1óÌ\]¯¼xñòñRuwKÏ n^ŸAä"$Ená 6‡ w—»D‚ZÍ>:Sîö}9“yÇ4¡$wE¸&ª¬)H‰$ô{W®>\ôşNò~M-8~kuˆèÈéÀµÎ˜ÎkAˆNYÀ<põ	ú1jBÛ(Š@Ë™Ä3™`ŠF“Q^ A´ıµ¸)V˜Å.[ğlËÑDÖ¦…)™¶öšó’˜÷U“{dñ ²{›qk
+ë=)Í­Ä…6Ôî›/Ü¢¶Wif²ÔM’¿çkMòŒ¾a¤ğFI™¤ÖMØÕİÁ¥#ª¹ê¥r–İ•£uOW)+óPİ#º”Œ‹+KİHª]Zğd’FLÌ0£²2Géó_óŞËÔÃİ'x‘ÅvH¦¶Fù‰Ë§woÎ@ì¦éú:¸’û¬2òh{Ë‹:IgºöÎté°Ô#»!{ìr¸N‘EöõÎŞöæt‡gTÍ†Æ¶éI9rùv˜™2arÇ—ÙYşÆÈÔ%nEË)/w+fbÊå©gÉE!ê ±Í‡¶‡Î®“µ™älòe@c=M­JÇyñ”sº©ùÔE9íÊàÅİÀâìàšĞ,6ÓëÒå&ˆf£~Qu^ÄÓ½öƒN9MMÙrr‡“üÅ´¦éğPKXvg¿©  Üò PK   !LëXåröDè   Ğ                   _rels/.relsPK   !LëXX{dä€  ş               !  docProps/core.xmlPK   !LëXºîKÖV  Q               à  docProps/app.xmlPK   !LëXáÖ €—   ñ                t  docProps/custom.xmlPK   !LëX´•ìü   ª               L  word/_rels/document.xml.relsPK   !LëXnH·Ø:  
+@               ’  word/numbering.xmlPK   !LëXÏz#^=  *               
+  word/fontTable.xmlPK   !LëXöÀr                 ‰  word/settings.xmlPK   !LëXO¸X  É               :  word/theme/theme1.xmlPK   !LëXùÓ1›   ô                ›  customXml/item1.xmlPK   !LëX“Ÿ•µÎ   D               w  customXml/itemProps1.xmlPK   !LëX²b¶w®                  ‹  customXml/_rels/item1.xml.relsPK   !LëX—†üš                 …  [Content_Types].xmlPK   !LëX<××?5  t<              `  word/styles.xmlPK   !LëXXvg¿©  Üò              ÜM  word/document.xmlPK      Ó  Ä]    
+// File: README.md
+# PDF Question Answering System
+
+This project implements a question answering system for PDF documents using hybrid search (vector and BM25) and language models. It provides an API for uploading PDFs, creating vector stores, and querying the documents.
+
+## Features
+
+- PDF text extraction and chunking
+- Hybrid search combining vector search (Chroma) and BM25
+- Language model integration for generating answers (using Ollama)
+- FastAPI-based API for PDF upload and querying
+- Persistence of vector stores for previously uploaded PDFs
+
+## Project Structure
+
+```
+pdf-qa-system/
+â”‚
+â”œâ”€â”€ data/
+â”‚   â”œâ”€â”€ docs/             # Directory for storing uploaded PDFs
+â”‚   â”œâ”€â”€ vector_stores/    # Directory for Chroma vector stores
+â”‚   â””â”€â”€ bm25_stores/      # Directory for BM25 stores
+â”‚
+â”œâ”€â”€ src/
+â”‚   â”œâ”€â”€ document_processing/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ pdf_extractor.py
+â”‚   â”‚   â””â”€â”€ vector_store.py
+â”‚   â”œâ”€â”€ embeddings/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â””â”€â”€ embedding_model.py
+â”‚   â”œâ”€â”€ search/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â””â”€â”€ hybrid_search.py
+â”‚   â””â”€â”€ utils/
+â”‚       â”œâ”€â”€ __init__.py
+â”‚       â””â”€â”€ file_utils.py
+â”‚
+â”œâ”€â”€ main.py               # Script for running queries directly
+â”œâ”€â”€ main_api.py           # FastAPI application for the API
+â”œâ”€â”€ requirements.txt
+â””â”€â”€ README.md
+```
+
+## Setup
+
+1. Ensure you have Python 3.8+ installed on your system.
+
+2. Navigate to the project directory.
+
+3. Create a virtual environment:
+   ```
+   python -m venv .venv
+   ```
+
+4. Activate the virtual environment:
+   - On Windows: `.venv\Scripts\activate`
+   - On macOS and Linux: `source .venv/bin/activate`
+
+5. Install the required dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+6. Set up the Ollama server:
+   - Follow the installation instructions at: https://github.com/jmorganca/ollama
+   - Ensure the Ollama server is running at http://localhost:11434/ before executing the scripts
+
+## Usage
+
+### Running the API
+
+1. Start the API server:
+   ```
+   python main_api.py
+   ```
+   The API will be available at http://localhost:8000
+
+2. Use the following endpoints:
+
+   - Upload a PDF:
+     ```
+     POST /upload_pdf
+     Content-Type: multipart/form-data
+     file: [PDF file]
+     ```
+
+   - Query a single question:
+     ```
+     POST /query
+     Content-Type: application/json
+     {
+       "query": "Your question here",
+       "pdf_id": "PDF_ID_returned_from_upload"
+     }
+     ```
+
+   - Query multiple questions:
+     ```
+     POST /multiple_queries
+     Content-Type: application/json
+     {
+       "queries": ["Question 1", "Question 2", ...],
+       "pdf_id": "PDF_ID_returned_from_upload"
+     }
+     ```
+
+### Running the Original Script
+
+To use the original script without the API:
+
+1. Place your PDF file in the project root directory.
+
+2. Modify the `questions` list in `main.py` to add or change the questions you want to ask about the PDF document.
+
+3. Run the main script:
+   ```
+   python main.py
+   ```
+
+## Troubleshooting
+
+- If you encounter OpenMP-related errors, add the following line at the beginning of your Python scripts:
+  ```python
+  import os
+  os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+  ```
+- Ensure that the Ollama server is running before making queries.
+- If you're having issues with specific PDFs, try re-uploading them to generate new vector stores.
+
+## Note
+
+This project uses the Ollama library, which requires separate installation and setup of the Ollama server. Make sure to complete the Ollama setup before running the scripts or API.
+
+
+// File: requirements.txt
+aiohttp==3.9.5
+aiosignal==1.3.1
+annotated-types==0.7.0
+attrs==23.2.0
+certifi==2024.6.2
+charset-normalizer==3.3.2
+colorama==0.4.6
+dataclasses-json==0.6.7
+faiss-cpu==1.8.0.post1
+filelock==3.15.4
+frozenlist==1.4.1
+fsspec==2024.6.1
+greenlet==3.0.3
+huggingface-hub==0.23.4
+idna==3.7
+intel-openmp==2021.4.0
+Jinja2==3.1.4
+jsonpatch==1.33
+jsonpointer==3.0.0
+langchain==0.2.6
+langchain-community==0.2.6
+langchain-core==0.2.10
+langchain-text-splitters==0.2.2
+langsmith==0.1.82
+MarkupSafe==2.1.5
+marshmallow==3.21.3
+mkl==2021.4.0
+mpmath==1.3.0
+multidict==6.0.5
+mypy-extensions==1.0.0
+networkx==3.3
+numpy==1.26.4
+orjson==3.10.5
+packaging==24.1
+pydantic==2.7.4
+pydantic_core==2.18.4
+PyMuPDF==1.24.7
+PyMuPDFb==1.24.6
+PyYAML==6.0.1
+rank-bm25==0.2.2
+regex==2024.5.15
+requests==2.32.3
+safetensors==0.4.3
+SQLAlchemy==2.0.31
+sympy==1.12.1
+tbb==2021.13.0
+tenacity==8.4.2
+tokenizers==0.19.1
+torch==2.3.1
+tqdm==4.66.4
+transformers==4.42.3
+typing-inspect==0.9.0
+typing_extensions==4.12.2
+urllib3==2.2.2
+yarl==1.9.4
+fastapi==0.110.0
+python-multipart==0.0.9
+uvicorn==0.27.1
+// File: src/document_processing/__init__.py
+
+// File: src/document_processing/pdf_extractor.py
+from langchain_community.document_loaders import PyMuPDFLoader
+
+def extract_text_from_pdf(pdf_path, chunk_size=200, overlap=50):
+    loader = PyMuPDFLoader(pdf_path)
+    data = loader.load()
+    
+    text_with_pages = []
+    for page_num, page in enumerate(data, start=1):
+        text = page.page_content
+        if text.strip():
+            start = 0
+            while start < len(text):
+                end = min(start + chunk_size, len(text))
+                chunk = text[start:end]
+                text_with_pages.append((chunk, page_num))
+                # print(f"Extracted chunk from page {page_num}: {chunk[:50]}...")
+                start += chunk_size - overlap
+        else:
+            print(f"Page {page_num} is empty.")
+    
+    return text_with_pages
+// File: src/document_processing/vector_store.py
+import os
+import pickle
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.retrievers import BM25Retriever
+from langchain.schema import Document
+from src.document_processing.pdf_extractor import extract_text_from_pdf
+
+def create_or_load_vector_store(
+    pdf_path, vector_store_dir="data/vector_stores", bm25_store_dir="data/bm25_stores"
+):
+    # Ensure the store directories exist
+    os.makedirs(vector_store_dir, exist_ok=True)
+    os.makedirs(bm25_store_dir, exist_ok=True)
+
+    file_name = os.path.basename(pdf_path)
+    file_name_without_ext = os.path.splitext(file_name)[0]
+    chroma_index_dir = os.path.join(vector_store_dir, f"chroma_{file_name_without_ext}")
+    bm25_index_file = os.path.join(bm25_store_dir, f"bm25_{file_name_without_ext}.pkl")
+
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-mpnet-base-v2")
+
+    if os.path.exists(chroma_index_dir) and os.path.exists(bm25_index_file):
+        print(f"Loading existing Chroma store: {chroma_index_dir} and BM25 store: {bm25_index_file}")
+        chroma_db = Chroma(persist_directory=chroma_index_dir, embedding_function=embeddings)
+        with open(bm25_index_file, 'rb') as f:
+            bm25_docs = pickle.load(f)
+        bm25 = BM25Retriever.from_documents(bm25_docs)
+    else:
+        print(f"Creating new Chroma store: {chroma_index_dir} and BM25 store: {bm25_index_file}")
+        pdf_text_with_pages = extract_text_from_pdf(pdf_path)
+        
+        bm25_docs = []
+        for text, page_num in pdf_text_with_pages:
+            bm25_docs.append(Document(page_content=text, metadata={"page": page_num}))
+
+        chroma_db = Chroma.from_documents(
+            documents=bm25_docs,
+            embedding=embeddings,
+            persist_directory=chroma_index_dir
+        )
+        chroma_db.persist()
+
+        bm25 = BM25Retriever.from_documents(bm25_docs)
+        with open(bm25_index_file, 'wb') as f:
+            pickle.dump(bm25_docs, f)
+
+    bm25_texts = [doc.page_content for doc in bm25_docs]
+
+    return chroma_db, bm25, bm25_texts
+// File: src/embeddings/__init__.py
+
+// File: src/embeddings/embedding_model.py
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "sentence-transformers/paraphrase-mpnet-base-v2"
+)
+model = AutoModel.from_pretrained(
+    "sentence-transformers/paraphrase-mpnet-base-v2")
+
+
+def get_embeddings(text):
+    inputs = tokenizer(text, return_tensors="pt",
+                       truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+    embeddings = outputs.last_hidden_state.mean(dim=1)
+    return embeddings
+
+// File: src/search/__init__.py
+
+// File: src/search/hybrid_search.py
+import numpy as np
+from langchain_community.llms import Ollama
+
+def jaccard_similarity(text1, text2):
+    set1 = set(text1.lower().split())
+    set2 = set(text2.lower().split())
+    intersection = set1.intersection(set2)
+    union = set1.union(set2)
+    if len(union) == 0:
+        return 0
+    return len(intersection) / len(union)
+
+def hybrid_search(query, chroma_db, bm25_retriever, bm25_texts, k=10):
+    # Vector search using Chroma
+    chroma_results = chroma_db.similarity_search_with_score(query, k=k)
+    chroma_indices = [bm25_texts.index(result[0].page_content) for result in chroma_results]
+    chroma_scores = [-score for _, score in chroma_results]  # Negate scores to align with BM25 scores
+
+    # BM25 search
+    bm25_results = bm25_retriever.get_relevant_documents(query)
+    bm25_indices = [bm25_texts.index(doc.page_content) for doc in bm25_results[:k]]
+    bm25_scores = [doc.metadata.get('score', 0) for doc in bm25_results[:k]]
+
+    # Combine results
+    combined_indices = np.concatenate((chroma_indices, bm25_indices))
+    combined_scores = np.concatenate((chroma_scores, bm25_scores))
+    sorted_indices = np.argsort(combined_scores)[::-1][:k]  # Sort in descending order
+
+    contexts_with_pages = [(bm25_texts[idx], idx) for idx in combined_indices[sorted_indices]]
+
+    return contexts_with_pages
+
+def process_questions(questions, pdf_text_with_pages, chroma_db, bm25_retriever, bm25_texts):
+    responses = []
+    llm = Ollama(model='llama3:8b')
+
+    for question in questions:
+        try:
+            contexts_with_pages = hybrid_search(question, chroma_db, bm25_retriever, bm25_texts, k=10)
+
+            retrieved_contexts = []
+            for content, idx in contexts_with_pages:
+                if content not in retrieved_contexts:
+                    retrieved_contexts.append(content)
+                    page_num = pdf_text_with_pages[idx][1]
+                    print(f"Retrieved chunk from page {page_num}: {content}")
+
+            combined_context = " ".join(retrieved_contexts)
+            combined_input = f"Context: {combined_context}\n\nQuery: {question}"
+            print(f"Combined input for the model:\n{combined_input}\n")
+
+            try:
+                response = llm.invoke(combined_input)
+                response_text = response if isinstance(response, str) else response.get('text', 'No response text available.')
+            except Exception as e:
+                print(f"Error calling Ollama: {str(e)}")
+                response_text = f"Error: Unable to generate response. Please try again later. (Error: {str(e)})"
+
+            highest_similarity = 0
+            final_page = None
+
+            for content, idx in contexts_with_pages:
+                similarity_score = jaccard_similarity(content, response_text)
+                if similarity_score > highest_similarity:
+                    highest_similarity = similarity_score
+                    final_page = pdf_text_with_pages[idx][1]
+
+            if final_page:
+                print(f"Final Page: {final_page} (Jaccard Similarity: {highest_similarity:.2f})")
+            else:
+                print("No page found for this question.")
+
+            response_with_page_info = {
+                "question": question,
+                "response": response_text,
+                "page": final_page if final_page else []
+            }
+            responses.append(response_with_page_info)
+        except Exception as e:
+            print(f"Error processing question: {str(e)}")
+            responses.append({
+                "question": question,
+                "response": f"Error: Unable to process the question. Please try again later. (Error: {str(e)})",
+                "page": []
+            })
+
+    return responses
+
+// File: src/utils/__init__.py
+
+// File: src/utils/file_utils.py
+import hashlib
+
+def generate_file_hash(file_path):
+    hasher = hashlib.md5()
+    with open(file_path, "rb") as file:
+        buf = file.read()
+        hasher.update(buf)
+    return hasher.hexdigest()
+
